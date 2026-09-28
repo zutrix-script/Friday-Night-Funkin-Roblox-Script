@@ -375,6 +375,7 @@
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script type="text/plain" id="lua-src">--[[
+--[[
     ╔══════════════════════════════════════════════════════╗
     ║         FNF ANIMATION INJECTOR v6.2                  ║
     ║  Arrow HUD • Dynamic Face • Anim Maker • Leg Lock    ║
@@ -440,6 +441,8 @@ local sectionPrevKey     = "LeftBracket"   -- [ to go prev
 --  STATE
 -- ============================================================
 local SpacingSystem          -- ★ forward-declared so F.setupCharacter can see it
+local SPACING                -- forward-declared: the save code above its definition needs it
+local INJECTOR_VERSION = "6.2"   -- up here so everything can read it
 local animTracks   = {}
 local idleTrack    = nil
 local connections  = {}
@@ -590,6 +593,13 @@ local Cut = {
     reach    = 0.1,      -- seconds a slice takes to reach its pose when you press
     snap     = false,    -- skip straight to the pose, no motion at all
     sliceGen = 0,        -- bumps on every press so stale watchers bow out
+
+    -- play the slice back to its start frame after it lands
+    reverse     = "OFF",   -- OFF / AUTO / RELEASE
+    returnPause = 0.08,    -- AUTO: how long it sits on the pose before going back
+    returnTime  = 0.25,    -- seconds the trip back takes
+    sliceStart  = 0,       -- start frame of the slice currently playing
+    holdAfterReturn = true, -- freeze on the start frame once it's back
     conn = nil,
 
     -- ui handles, filled in by the tab builder
@@ -665,18 +675,82 @@ local Notes = {
     length     = 170,    -- how long the streak is when full, in pixels
     grow       = "UP",   -- UP: streak grows away from the arrows. DOWN: toward the screen edge
 
-    -- rewards
-    holdHealPerSec = 0.05,  -- trickle while the streak fills
-    fullHoldHeal   = 0.22,  -- burst for filling it completely
-    healRate       = 1.4,   -- how fast that burst pours in (per second)
+    -- while the streak fills
+    holdHealPerSec = 0.05,  -- health per second
     scorePerSec    = 250,
-    fullHoldBonus  = 400,
 
     -- live
-    held = {},           -- [dir] = { start, tail, done }
-    layer = nil, scoreLbl = nil, judgeLbl = nil,
-    score = 0, best = 0, streak = 0, pendingHeal = 0,
+    held = {},           -- [dir] = { start, tail }
+    layer = nil, scoreLbl = nil,
+    score = 0, best = 0,
     conn = nil,
+}
+
+-- ============================================================
+--  INTRO STATE — loading screen + first-time tour
+-- ============================================================
+local Intro = {
+    seen            = false,  -- has this player finished (or skipped) the tour?
+    backdropOpacity = 0.5,    -- loading screen backdrop, 0.5 = 50%
+    titleOpacity    = 0.5,    -- the title slams in at 50%
+    duration        = 2.9,    -- seconds the loading screen runs
+
+    loadGui = nil, loadDone = false, skip = false,
+    tourGui = nil, step = 1, pulse = nil,
+}
+
+-- ============================================================
+--  VIDEO PLAYER STATE — local video files, only you see them
+-- ============================================================
+local Vid = {
+    folder  = "FNFInjector/videos",   -- the drop box, inside your executor's workspace
+    volume  = 0.6,
+    opacity = 0,          -- 0 = solid, 1 = invisible
+    looped  = true,
+    display = "WINDOW",   -- WINDOW / FULLSCREEN / BACKDROP
+    scale   = 1,          -- window size multiplier
+    lastFile = "",
+
+    -- black screen fade
+    boKey     = "L",
+    boFadeIn  = 0.35,     -- seconds to go black
+    boHold    = 0.4,      -- seconds fully black
+    boFadeOut = 2.5,      -- seconds to slowly come back
+    boToken   = 0,
+
+    -- video stage: you + your opponent drawn over the video
+    stage = { on = false, gui = nil, vp = nil, cam = nil, me = nil, opp = nil,
+              prevDisplay = nil, watch = nil },
+
+    -- live
+    gui = nil, window = nil, frame = nil, bar = nil, timeLbl = nil,
+    boGui = nil, current = nil, api = {},
+}
+
+-- ============================================================
+--  RESULT STATE — win / lose, your call
+-- ============================================================
+local Result = {
+    winKey  = "Y",
+    loseKey = "U",
+
+    -- win
+    cheerId   = "",      -- blank = your avatar's own cheer (works anywhere)
+    cheerLoop = false,
+    cheerTime = 3,       -- seconds to keep cheering when looping
+
+    -- lose
+    sitId      = "",     -- blank = your avatar's own sit
+    flingSpeed = 96,     -- studs/s  (96 ≈ 60 mph)
+    lift       = 45,     -- upward kick, studs/s
+    spin       = 12,     -- tumble, radians/s
+    direction  = "AWAY", -- AWAY from opponent / BACK / RANDOM
+    getUpAfter = 2.5,    -- seconds before you recover
+
+    banner = true,       -- big YOU WIN / YOU LOSE text
+
+    -- live
+    gui = nil, bannerLbl = nil, winTrack = nil, sitTrack = nil, token = 0,
 }
 
 -- ============================================================
@@ -813,7 +887,7 @@ local Chaos = {
 
 
 -- RP / TARGET STATE
-local rpModeEnabled   = true
+local rpModeEnabled   = false   -- was true while its button said OFF
 local currentTarget   = nil
 local rpMoveStep      = 1.5
 local rpMinDistance   = 3.5
@@ -1038,7 +1112,7 @@ function CameraSystem.new()
 
     -- upgraded follow
     -- hit reactions (the camera update)
-    self.snapHits      = true       -- kicks land instantly, after smoothing
+    self.snapHits      = false      -- kicks land instantly, after smoothing
     self.nudgeScale    = 1          -- how far a note throws the frame
     self.tiltScale     = 1          -- how much LEFT/RIGHT roll the frame
     self.punchScale    = 1          -- FOV dip per hit
@@ -1070,7 +1144,7 @@ function CameraSystem.new()
     self.cranePhase    = 0
     self.lastCutSubject = nil
     self.lastCutTime   = 0
-    self.settleEnabled = true
+    self.settleEnabled = false
     self.settleAfter   = 1.6    -- seconds of silence before the camera locks
     self.settled       = false
 
@@ -2512,6 +2586,9 @@ function Keys.rows()
     add(Keys.beatKey, "Beat zoom")
     add(Pose.dodgeKey, "Dodge animation")
     add(Notes.key, "Hold streaks")
+    add(Vid.boKey, "Black screen fade")
+    add(Result.winKey, "Win")
+    add(Result.loseKey, "Lose")
 
     add("--", "INTRO TRANSITIONS")
     for _, e in ipairs(Keys.intro) do add(e.key, e.label) end
@@ -2825,6 +2902,8 @@ function Save.collect()
 
     return {
         version = INJECTOR_VERSION,
+        defaultsVersion = 2,
+        tourSeen = Intro.seen,
         binds = binds,
         sections = secs,
         currentSection = currentSectionIdx,
@@ -2836,7 +2915,9 @@ function Save.collect()
         legsLocked = legsLocked,
         vinyl = { id = VINYL_DECAL_ID, rpm = vinylBaseRPM },
 
-        cutterResponse = { reach = Cut.reach, snap = Cut.snap },
+        cutterResponse = { reach = Cut.reach, snap = Cut.snap, reverse = Cut.reverse,
+                           returnPause = Cut.returnPause, returnTime = Cut.returnTime,
+                           holdAfterReturn = Cut.holdAfterReturn },
         cutter = { id = cutterAnimId, slices = {
             LEFT = cutterSlices.LEFT, DOWN = cutterSlices.DOWN,
             UP = cutterSlices.UP, RIGHT = cutterSlices.RIGHT } },
@@ -2909,10 +2990,19 @@ function Save.collect()
                  shakeScale = Ride.shakeScale, windScale = Ride.windScale,
                  leanScale = Ride.leanScale },
 
+        result = { winKey = Result.winKey, loseKey = Result.loseKey, cheerId = Result.cheerId,
+                   cheerLoop = Result.cheerLoop, cheerTime = Result.cheerTime, sitId = Result.sitId,
+                   flingSpeed = Result.flingSpeed, lift = Result.lift, spin = Result.spin,
+                   direction = Result.direction, getUpAfter = Result.getUpAfter, banner = Result.banner },
+
+        video = { volume = Vid.volume, opacity = Vid.opacity, looped = Vid.looped,
+                  display = Vid.display, scale = Vid.scale, lastFile = Vid.lastFile,
+                  boKey = Vid.boKey, boFadeIn = Vid.boFadeIn, boHold = Vid.boHold,
+                  boFadeOut = Vid.boFadeOut },
+
         notes = { enabled = Notes.enabled, key = Notes.key, grow = Notes.grow,
                   fullTime = Notes.fullTime, startDelay = Notes.startDelay, length = Notes.length,
-                  fullHoldHeal = Notes.fullHoldHeal, holdHealPerSec = Notes.holdHealPerSec,
-                  healRate = Notes.healRate, best = Notes.best },
+                  holdHealPerSec = Notes.holdHealPerSec, best = Notes.best },
 
         pose = { reach = Pose.reach, snap = Pose.snap,
                  dodgeKey = Pose.dodgeKey, dodgeId = Pose.dodgeId, dodgeSpeed = Pose.dodgeSpeed },
@@ -2941,6 +3031,7 @@ function Save.collect()
             pushPerHit = fightState.pushPerHit, pushPerDouble = fightState.pushPerDouble,
             momentumCap = fightState.momentumCap,
             proximityDist = proximityBlockDist, proximityOn = proximityBlockEnabled,
+            rpMode = rpModeEnabled,
         },
     }
 end
@@ -3052,6 +3143,13 @@ function Save.apply(d, silentUi)
         if type(d.cutterResponse) == "table" then
             Cut.reach = num(d.cutterResponse.reach, Cut.reach)
             if type(d.cutterResponse.snap) == "boolean" then Cut.snap = d.cutterResponse.snap end
+            local rv = d.cutterResponse.reverse
+            if rv == "OFF" or rv == "AUTO" or rv == "RELEASE" then Cut.reverse = rv end
+            Cut.returnPause = num(d.cutterResponse.returnPause, Cut.returnPause)
+            Cut.returnTime = num(d.cutterResponse.returnTime, Cut.returnTime)
+            if type(d.cutterResponse.holdAfterReturn) == "boolean" then
+                Cut.holdAfterReturn = d.cutterResponse.holdAfterReturn
+            end
         end
         if type(d.cutter) == "table" then
             -- an empty saved id keeps the default instead of wiping it
@@ -3108,6 +3206,8 @@ function Save.apply(d, silentUi)
     sec("hold",    function() copyInto(Hold, d.hold) end)
     sec("pose",    function() copyInto(Pose, d.pose, { cache = true, owner = true }) end)
     sec("notes",   function() copyInto(Notes, d.notes, { held = true }) end)
+    sec("video",   function() copyInto(Vid, d.video) end)
+    sec("result",  function() copyInto(Result, d.result) end)
     sec("spacing", function() copyInto(SPACING, d.spacing) end)
     sec("chaos",   function() copyInto(Chaos, d.chaos, { enabled = true }) end)
     sec("sil",     function() copyInto(SilFX, d.sil) end)
@@ -3159,7 +3259,19 @@ function Save.apply(d, silentUi)
         fightState.momentumCap   = num(f.momentumCap, fightState.momentumCap)
         proximityBlockDist       = num(f.proximityDist, proximityBlockDist)
         proximityBlockEnabled    = pick(f.proximityOn, proximityBlockEnabled)
+        if type(f.rpMode) == "boolean" then rpModeEnabled = f.rpMode end
     end)
+
+    -- anyone with a save file from before the tour existed isn't new
+    if d.tourSeen == true or d.tourSeen == nil then Intro.seen = true end
+
+    -- saves from before defaults v2 had these switched on without you asking
+    if (tonumber(d.defaultsVersion) or 1) < 2 then
+        FNFCamera.snapHits = false
+        FNFCamera.settleEnabled = false
+        SPACING.enabled = false
+        rpModeEnabled = false
+    end
 
     return true, failed
 end
@@ -3286,6 +3398,7 @@ end
 
 function Save.startAuto()
 Notes.start()
+pcall(Intro.finishBoot)
     if Save.autoThread then return end
     Save.autoThread = task.spawn(function()
         while true do
@@ -3673,12 +3786,10 @@ end
 
 -- ============================================================
 --  HOLD STREAK
---  Hold any note key and a streak grows out of that arrow. Fill
---  it all the way and a burst of health pours back in with a
---  score bonus. Let go early and you keep only part of the score.
---  Taps never make a streak, and a filled streak stops paying
---  until you let go and hold again, so it can't be farmed by
---  just sitting on a key.
+--  Hold a note key and a streak grows out of that arrow; let go
+--  and it pulls back in. Health and score trickle in while it
+--  fills. Taps never make a streak, and a full streak stops
+--  paying, so sitting on a key can't farm health.
 -- ============================================================
 function Notes.strumY() return Arrows.size / 2 end
 function Notes.laneX(dir)
@@ -3686,8 +3797,8 @@ function Notes.laneX(dir)
     return f and (f.slot + Arrows.size / 2) or 0
 end
 
--- The streak layer lives inside the arrow strip, so streaks move, lean
--- and bob with it. The strip gets rebuilt sometimes, so re-home when it does.
+-- Lives inside the arrow strip so streaks move, lean and bob with it.
+-- The strip gets rebuilt sometimes, so re-home when it does.
 function Notes.ensureLayer()
     local holder = Arrows.container
     if not holder or not holder.Parent then return nil end
@@ -3717,90 +3828,28 @@ function Notes.ensureLayer()
     score.ZIndex = F.silZ(66)
     score.Parent = layer
     Notes.scoreLbl = score
-
-    local judge = Instance.new("TextLabel")
-    judge.Name = "Judge"
-    judge.Size = UDim2.new(1, 0, 0, 30)
-    judge.Position = UDim2.new(0, 0, 0, -80)
-    judge.BackgroundTransparency = 1
-    judge.Font = Enum.Font.GothamBlack
-    judge.TextSize = 24
-    judge.TextStrokeTransparency = 0.4
-    judge.TextTransparency = 1
-    judge.ZIndex = F.silZ(66)
-    judge.Parent = layer
-    Notes.judgeLbl = judge
     return layer
 end
 
-function Notes.judge(text, color)
-    local l = Notes.judgeLbl
-    if not l then return end
-    l.Text = text
-    l.TextColor3 = color or Color3.fromRGB(255, 255, 255)
-    l.TextTransparency = 0
-    l.TextSize = 30
-    TweenService:Create(l, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-        { TextSize = 24 }):Play()
-    task.delay(0.6, function()
-        if l.Text == text then
-            TweenService:Create(l, TweenInfo.new(0.3), { TextTransparency = 1 }):Play()
-        end
-    end)
-end
-
-function Notes.addScore(v)
-    Notes.score = Notes.score + v
-    if Notes.score > Notes.best then Notes.best = Notes.score end
-end
-
--- Key down on a note: start timing the hold. The streak itself only
--- appears once it's clearly a hold, not a tap.
 function Notes.press(dir)
     if not Notes.enabled then return end
     local old = Notes.held[dir]
     if old and old.tail then old.tail:Destroy() end
-    Notes.held[dir] = { start = os.clock(), tail = nil, done = false }
+    Notes.held[dir] = { start = os.clock(), tail = nil }
 end
 
--- Key up: a full streak already paid out; a partial one keeps some score.
 function Notes.release(dir)
     local h = Notes.held[dir]
     Notes.held[dir] = nil
-    if not h then return end
-
-    if h.tail and not h.done then
-        local frac = math.clamp((os.clock() - h.start - Notes.startDelay) / math.max(Notes.fullTime, 0.05), 0, 1)
-        Notes.addScore(Notes.fullHoldBonus * frac * 0.3)
-        Notes.streak = 0
-        if frac >= 0.25 then
-            Notes.judge(string.format("%d%%", math.floor(frac * 100)), Color3.fromRGB(255, 170, 90))
-        end
-    end
-
-    -- retract the streak back into the arrow and fade it
-    if h.tail then
-        local tail = h.tail
-        local sign = (Notes.grow == "UP") and -1 or 1
-        TweenService:Create(tail, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-            Size = UDim2.new(0, Arrows.size * 0.3, 0, 0),
-            Position = UDim2.new(0, Notes.laneX(dir), 0, Notes.strumY()),
-            BackgroundTransparency = 1,
-        }):Play()
-        task.delay(0.2, function() if tail then tail:Destroy() end end)
-    end
-end
-
-function Notes.fill(dir, h)
-    h.done = true
-    Notes.streak = Notes.streak + 1
-    Notes.pendingHeal = Notes.pendingHeal + Notes.fullHoldHeal
-    Notes.addScore(Notes.fullHoldBonus * (1 + math.min(Notes.streak, 10) * 0.1))
-    Notes.judge(Notes.streak > 1 and ("PERFECT HOLD x" .. Notes.streak) or "PERFECT HOLD",
-        ARROW_COLORS[dir].hit)
-    F.spawnSplash(dir)
-    if Chaos.enabled then Chaos.hit(1.1, dir) end
-    FNFCamera:DoubleNoteZoom(0.6)
+    if not h or not h.tail then return end
+    -- pull the streak back into the arrow and fade it
+    local tail = h.tail
+    TweenService:Create(tail, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+        Size = UDim2.new(0, Arrows.size * 0.3, 0, 0),
+        Position = UDim2.new(0, Notes.laneX(dir), 0, Notes.strumY()),
+        BackgroundTransparency = 1,
+    }):Play()
+    task.delay(0.18, function() if tail then tail:Destroy() end end)
 end
 
 function Notes.step(dt)
@@ -3809,21 +3858,12 @@ function Notes.step(dt)
     if not layer then return end
     dt = math.clamp(dt, 0, 1/20)
     local now = os.clock()
-
-    -- pour the full-hold burst in quickly rather than all at once
-    if Notes.pendingHeal > 0 then
-        local amt = math.min(Notes.pendingHeal, Notes.healRate * dt)
-        Notes.pendingHeal = Notes.pendingHeal - amt
-        Health.hp = math.clamp(Health.hp + amt, 0, 1)
-    end
-
     local sign = (Notes.grow == "UP") and -1 or 1
     local sY = Notes.strumY()
 
     for dir, h in pairs(Notes.held) do
         local elapsed = now - h.start - Notes.startDelay
         if elapsed > 0 then
-            -- past the tap threshold: this is a hold, so show the streak
             if not h.tail then
                 local tail = Instance.new("Frame")
                 tail.AnchorPoint = Vector2.new(0.5, 0)
@@ -3842,30 +3882,23 @@ function Notes.step(dt)
             h.tail.Position = UDim2.new(0, Notes.laneX(dir), 0, top)
             h.tail.Size = UDim2.new(0, Arrows.size * 0.3, 0, len)
 
-            if not h.done then
-                -- trickle health and score while it fills
+            -- trickle only while it's still filling
+            if frac < 1 then
                 Health.hp = math.clamp(Health.hp + Notes.holdHealPerSec * dt, 0, 1)
-                Notes.addScore(Notes.scorePerSec * dt)
-                if frac >= 1 then Notes.fill(dir, h) end
-            else
-                -- full: throb so it's obvious you've maxed it
-                h.tail.BackgroundTransparency = 0.05 + 0.2 * math.abs(math.sin(now * 10))
+                Notes.score = Notes.score + Notes.scorePerSec * dt
+                if Notes.score > Notes.best then Notes.best = Notes.score end
             end
         end
     end
 
     if Notes.scoreLbl then
-        Notes.scoreLbl.Text = (Notes.score > 0)
-            and string.format("SCORE %d%s", math.floor(Notes.score),
-                Notes.streak > 1 and ("   HOLD STREAK " .. Notes.streak) or "")
-            or ""
+        Notes.scoreLbl.Text = (Notes.score > 0) and string.format("SCORE %d", math.floor(Notes.score)) or ""
     end
 end
 
 function Notes.clear()
     for _, h in pairs(Notes.held) do if h.tail then h.tail:Destroy() end end
     Notes.held = {}
-    Notes.pendingHeal = 0
 end
 
 function Notes.start()
@@ -3886,7 +3919,1085 @@ function Notes.setEnabled(state)
 end
 
 function Notes.resetScore()
-    Notes.score, Notes.streak = 0, 0
+    Notes.score = 0
+end
+
+-- ============================================================
+--  LOADING SCREEN
+--  Arrows pop in one by one, then the title slams in out of
+--  nowhere. It checks for a saved setup and tells you whether
+--  you're new or back. Click or press any key to skip.
+-- ============================================================
+function Intro.isNew()
+    if Intro.seen then return false end
+    -- same session re-inject with no file access: remember via getgenv
+    local g
+    pcall(function() g = getgenv().FNFInjectorTourSeen end)
+    return not g
+end
+
+function Intro.markSeen()
+    Intro.seen = true
+    pcall(function() getgenv().FNFInjectorTourSeen = true end)
+    if Save.available then pcall(function() Save.write(Save.slot, true) end) end
+end
+
+function Intro.startLoading()
+    local old = PlayerGui:FindFirstChild("FNFLoading")
+    if old then old:Destroy() end
+    Intro.loadDone, Intro.skip = false, false
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FNFLoading"
+    sg.IgnoreGuiInset = true
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = F.silZ(195)
+    sg.Parent = PlayerGui
+    Intro.loadGui = sg
+
+    local back = Instance.new("Frame")
+    back.Size = UDim2.new(1, 0, 1, 0)
+    back.BackgroundColor3 = Color3.fromRGB(6, 5, 12)
+    back.BackgroundTransparency = 1
+    back.BorderSizePixel = 0
+    back.Active = true
+    back.ZIndex = F.silZ(190)
+    back.Parent = sg
+
+    -- the arrows, centred, all hidden to start
+    local arrows = {}
+    local ARW, GAP = 78, 18
+    local totalW = #ARROW_ORDER * ARW + (#ARROW_ORDER - 1) * GAP
+    for i, dir in ipairs(ARROW_ORDER) do
+        local a = Instance.new("Frame")
+        a.AnchorPoint = Vector2.new(0.5, 0.5)
+        a.Position = UDim2.new(0.5, -totalW / 2 + (i - 1) * (ARW + GAP) + ARW / 2, 0.5, 40)
+        a.Size = UDim2.new(0, 0, 0, 0)
+        a.Rotation = -25
+        a.BackgroundColor3 = ARROW_COLORS[dir].hit
+        a.BorderSizePixel = 0
+        a.ZIndex = F.silZ(192)
+        a.Parent = back
+        F.uiCorner(a, UDim.new(0, 16))
+        F.uiStroke(a, Color3.fromRGB(255, 255, 255), 2).Transparency = 0.3
+        local s = Instance.new("TextLabel")
+        s.Size = UDim2.new(1, 0, 1, 0)
+        s.BackgroundTransparency = 1
+        s.Text = ARROW_SYMBOLS[dir]
+        s.TextColor3 = Color3.fromRGB(255, 255, 255)
+        s.Font = Enum.Font.GothamBlack
+        s.TextScaled = true
+        s.ZIndex = F.silZ(193)
+        s.Parent = a
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop = UDim.new(0.2, 0); pad.PaddingBottom = UDim.new(0.2, 0)
+        pad.Parent = s
+        arrows[i] = a
+    end
+
+    -- the title, invisible until it slams in
+    local title = Instance.new("TextLabel")
+    title.AnchorPoint = Vector2.new(0.5, 0.5)
+    title.Position = UDim2.new(0.5, 0, 0.5, -60)
+    title.Size = UDim2.new(1, 0, 0, 80)
+    title.BackgroundTransparency = 1
+    title.Text = "FNF ANIM INJECTOR"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 120
+    title.TextTransparency = 1
+    title.TextStrokeColor3 = THEMES[currentThemeName].accent
+    title.TextStrokeTransparency = 1
+    title.ZIndex = F.silZ(193)
+    title.Parent = back
+
+    local flash = Instance.new("Frame")
+    flash.Size = UDim2.new(1, 0, 1, 0)
+    flash.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    flash.BackgroundTransparency = 1
+    flash.BorderSizePixel = 0
+    flash.ZIndex = F.silZ(194)
+    flash.Parent = back
+
+    local status = F.makeLabel(back, "", UDim2.new(0, 0, 0.5, 100), UDim2.new(1, 0, 0, 20),
+        Color3.fromRGB(220, 220, 235), Enum.TextXAlignment.Center, 13)
+    status.Font = Enum.Font.GothamMedium
+    status.ZIndex = F.silZ(193)
+
+    local barBg = Instance.new("Frame")
+    barBg.AnchorPoint = Vector2.new(0.5, 0)
+    barBg.Position = UDim2.new(0.5, 0, 0.5, 128)
+    barBg.Size = UDim2.new(0, 260, 0, 4)
+    barBg.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    barBg.BackgroundTransparency = 0.85
+    barBg.BorderSizePixel = 0
+    barBg.ZIndex = F.silZ(193)
+    barBg.Parent = back
+    F.uiCorner(barBg, UDim.new(1, 0))
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = THEMES[currentThemeName].accent
+    barFill.BorderSizePixel = 0
+    barFill.ZIndex = F.silZ(194)
+    barFill.Parent = barBg
+    F.uiCorner(barFill, UDim.new(1, 0))
+
+    local hint = F.makeLabel(back, "click or press any key to skip", UDim2.new(0, 0, 1, -40),
+        UDim2.new(1, 0, 0, 16), Color3.fromRGB(150, 150, 170), Enum.TextXAlignment.Center, 10)
+    hint.ZIndex = F.silZ(193)
+
+    -- skip on click or any key
+    local skipConns = {}
+    local function doSkip() Intro.skip = true end
+    table.insert(skipConns, back.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then doSkip() end
+    end))
+    table.insert(skipConns, UserInputService.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Keyboard then doSkip() end
+    end))
+
+    -- a wait that ends early if you skip
+    local function wait(sec)
+        local t0 = os.clock()
+        while os.clock() - t0 < sec do
+            if Intro.skip then return end
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    task.spawn(function()
+        -- backdrop in
+        TweenService:Create(back, TweenInfo.new(0.25), { BackgroundTransparency = Intro.backdropOpacity }):Play()
+        wait(0.2)
+
+        -- arrows pop one after another
+        for _, a in ipairs(arrows) do
+            if Intro.skip then break end
+            TweenService:Create(a, TweenInfo.new(0.32, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, ARW, 0, ARW), Rotation = 0,
+            }):Play()
+            wait(0.11)
+        end
+        wait(0.35)
+
+        -- title out of nowhere: no fade, it's just there, with a flash
+        title.TextTransparency = Intro.titleOpacity
+        title.TextStrokeTransparency = 0.4
+        TweenService:Create(title, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { TextSize = 58 }):Play()
+        flash.BackgroundTransparency = 0.55
+        TweenService:Create(flash, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+        for _, a in ipairs(arrows) do
+            TweenService:Create(a, TweenInfo.new(0.08), { Size = UDim2.new(0, ARW * 1.12, 0, ARW * 1.12) }):Play()
+        end
+        wait(0.1)
+        for _, a in ipairs(arrows) do
+            TweenService:Create(a, TweenInfo.new(0.2, Enum.EasingStyle.Back),
+                { Size = UDim2.new(0, ARW, 0, ARW) }):Play()
+        end
+
+        -- scan for a saved setup
+        status.Text = "scanning for your setup..."
+        TweenService:Create(barFill, TweenInfo.new(math.max(0.2, Intro.duration - 1.6), Enum.EasingStyle.Quad),
+            { Size = UDim2.new(1, 0, 1, 0) }):Play()
+        wait(0.7)
+        if Intro.isNew() then
+            status.Text = "new here? quick tour coming up"
+            status.TextColor3 = Color3.fromRGB(120, 230, 255)
+        else
+            status.Text = "welcome back — loading your setup"
+            status.TextColor3 = Color3.fromRGB(120, 255, 150)
+        end
+        wait(math.max(0.3, Intro.duration - 1.9))
+
+        -- out
+        for _, c in ipairs(skipConns) do c:Disconnect() end
+        local out = TweenInfo.new(0.35, Enum.EasingStyle.Quad)
+        TweenService:Create(back, out, { BackgroundTransparency = 1 }):Play()
+        for _, d in ipairs(back:GetDescendants()) do
+            if d:IsA("TextLabel") then
+                TweenService:Create(d, out, { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+            elseif d:IsA("Frame") then
+                TweenService:Create(d, out, { BackgroundTransparency = 1 }):Play()
+            elseif d:IsA("UIStroke") then
+                TweenService:Create(d, out, { Transparency = 1 }):Play()
+            end
+        end
+        task.wait(0.38)
+        sg:Destroy()
+        Intro.loadDone = true
+    end)
+end
+
+-- ============================================================
+--  FIRST-TIME TOUR
+--  Five cards, each switching the panel to the tab it explains
+--  and pulsing that tab's button.
+-- ============================================================
+local TOUR = {
+    {
+        tab = "📋 BINDS", title = "1  ·  YOUR BINDS",
+        body = "These are your four notes: Z X C V play LEFT, DOWN, UP and RIGHT. "
+            .. "Click a key to change it, paste an animation ID into the box to set that note's pose, "
+            .. "and hold TEST to preview. Start here — set up your four poses first.",
+        chips = { "Z", "X", "C", "V" },
+    },
+    {
+        tab = "🎥 CAM", title = "2  ·  THE CAMERA",
+        body = "Turn on the cinematic camera, then type your opponent's name under SET OPPONENT "
+            .. "and it frames the two of you. FIND A MATCH scans the server for other players "
+            .. "who are running this script, so you can battle someone who has it too.",
+    },
+    {
+        tab = "✂ CUTTER", title = "3  ·  EMOTE CUTTER",
+        body = "Cuts one emote into four poses. Give each note an animation, scrub the timeline "
+            .. "to the frame you want, and mark it. Switch CUTTER ON and your note keys play "
+            .. "your cuts instead of the normal binds.",
+    },
+    {
+        tab = "🎬 MAKER", title = "4  ·  EVERYTHING ELSE",
+        body = "MAKER builds animation sequences and song sections. PREVIEW shows your character "
+            .. "live. FAVES and LIST store animations you like. FX has the music player and visual "
+            .. "extras. Press ` any time for a list of every keybind.",
+    },
+    {
+        tab = "⚙ SETTINGS", title = "5  ·  SETTINGS",
+        body = "Themes, the arrow HUD, save slots and autosave all live here. Your setup saves "
+            .. "on its own, so it'll be waiting next time. You can replay this tour from here "
+            .. "whenever you like.",
+    },
+}
+
+function Intro.pulseTab(name)
+    if Intro.pulse then Intro.pulse:Destroy(); Intro.pulse = nil end
+    local btn = F.tabButtons and F.tabButtons[name]
+    if not btn then return end
+    local s = Instance.new("UIStroke")
+    s.Name = "TourPulse"
+    s.Color = Color3.fromRGB(255, 220, 90)
+    s.Thickness = 2
+    s.Parent = btn
+    Intro.pulse = s
+    task.spawn(function()
+        while s.Parent do
+            s.Transparency = 0.1 + 0.6 * math.abs(math.sin(os.clock() * 5))
+            RunService.Heartbeat:Wait()
+        end
+    end)
+end
+
+function Intro.endTour()
+    if Intro.pulse then Intro.pulse:Destroy(); Intro.pulse = nil end
+    if Intro.tourGui then Intro.tourGui:Destroy(); Intro.tourGui = nil end
+    if F.selectTab then F.selectTab("📋 BINDS") end
+    Intro.markSeen()
+end
+
+function Intro.startTour()
+    if Intro.tourGui then Intro.tourGui:Destroy() end
+    Intro.step = 1
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FNFTour"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = F.silZ(180)
+    sg.Parent = PlayerGui
+    Intro.tourGui = sg
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(0, 340, 0, 250)
+    card.Position = UDim2.new(0, 520, 0, 80)
+    card.BackgroundColor3 = Color3.fromRGB(16, 15, 24)
+    card.BorderSizePixel = 0
+    card.Active = true
+    card.Draggable = true
+    card.Parent = sg
+    F.uiCorner(card, UDim.new(0, 14))
+    F.uiStroke(card, Color3.fromRGB(255, 220, 90), 1.5).Transparency = 0.3
+
+    local tag = F.makeLabel(card, "QUICK TOUR", UDim2.new(0, 16, 0, 12), UDim2.new(0, 160, 0, 14),
+        Color3.fromRGB(255, 220, 90), Enum.TextXAlignment.Left, 10)
+    tag.Font = Enum.Font.GothamBold
+    local count = F.makeLabel(card, "", UDim2.new(1, -96, 0, 12), UDim2.new(0, 80, 0, 14),
+        Color3.fromRGB(150, 150, 170), Enum.TextXAlignment.Right, 10)
+
+    local title = F.makeLabel(card, "", UDim2.new(0, 16, 0, 30), UDim2.new(1, -32, 0, 24),
+        Color3.fromRGB(255, 255, 255), Enum.TextXAlignment.Left, 16)
+    title.Font = Enum.Font.GothamBlack
+
+    local body = F.makeLabel(card, "", UDim2.new(0, 16, 0, 60), UDim2.new(1, -32, 0, 104),
+        Color3.fromRGB(210, 210, 225), Enum.TextXAlignment.Left, 11)
+    body.TextWrapped = true
+    body.TextYAlignment = Enum.TextYAlignment.Top
+
+    -- key chips, used on the binds card
+    local chipRow = Instance.new("Frame")
+    chipRow.Size = UDim2.new(1, -32, 0, 30)
+    chipRow.Position = UDim2.new(0, 16, 0, 160)
+    chipRow.BackgroundTransparency = 1
+    chipRow.Parent = card
+    local chipLayout = Instance.new("UIListLayout")
+    chipLayout.FillDirection = Enum.FillDirection.Horizontal
+    chipLayout.Padding = UDim.new(0, 8)
+    chipLayout.Parent = chipRow
+
+    -- progress dots
+    local dots = {}
+    for i = 1, #TOUR do
+        local d = Instance.new("Frame")
+        d.Size = UDim2.new(0, 8, 0, 8)
+        d.Position = UDim2.new(0, 16 + (i - 1) * 14, 1, -46)
+        d.BorderSizePixel = 0
+        d.Parent = card
+        F.uiCorner(d, UDim.new(1, 0))
+        dots[i] = d
+    end
+
+    local skip = F.makeBtn(card, "SKIP", UDim2.new(0, 16, 1, -32), UDim2.new(0, 70, 0, 24),
+        Color3.fromRGB(45, 40, 60), nil, 10)
+    local back = F.makeBtn(card, "BACK", UDim2.new(1, -176, 1, -32), UDim2.new(0, 70, 0, 24),
+        Color3.fromRGB(45, 40, 60), nil, 10)
+    local nextB = F.makeBtn(card, "NEXT", UDim2.new(1, -100, 1, -32), UDim2.new(0, 84, 0, 24),
+        Color3.fromRGB(255, 190, 60), Color3.fromRGB(20, 20, 25), 11)
+
+    local function show()
+        local s = TOUR[Intro.step]
+        count.Text = Intro.step .. " / " .. #TOUR
+        title.Text = s.title
+        body.Text = s.body
+        for _, c in ipairs(chipRow:GetChildren()) do
+            if c:IsA("TextLabel") then c:Destroy() end
+        end
+        -- binds card: show the player's real keys, not just the defaults
+        if s.chips then
+            for i, row in ipairs(CurrentBindings) do
+                local chip = Instance.new("TextLabel")
+                chip.Size = UDim2.new(0, 56, 0, 28)
+                chip.BackgroundColor3 = ARROW_COLORS[row.dir].hit
+                chip.Text = row.key .. " " .. ARROW_SYMBOLS[row.dir]
+                chip.TextColor3 = Color3.fromRGB(15, 15, 20)
+                chip.Font = Enum.Font.GothamBlack
+                chip.TextSize = 12
+                chip.LayoutOrder = i
+                chip.Parent = chipRow
+                F.uiCorner(chip, UDim.new(0, 7))
+            end
+        end
+        for i, d in ipairs(dots) do
+            d.BackgroundColor3 = (i == Intro.step) and Color3.fromRGB(255, 220, 90) or Color3.fromRGB(60, 58, 75)
+        end
+        back.Visible = Intro.step > 1
+        nextB.Text = (Intro.step == #TOUR) and "LET'S GO" or "NEXT"
+
+        -- take them to the tab this card is about
+        if F.selectTab then F.selectTab(s.tab) end
+        Intro.pulseTab(s.tab)
+        local main = PlayerGui:FindFirstChild("FNFInjectorGui")
+        main = main and main:FindFirstChild("Main")
+        if main then main.Visible = true end
+    end
+
+    nextB.MouseButton1Click:Connect(function()
+        if Intro.step >= #TOUR then Intro.endTour() return end
+        Intro.step = Intro.step + 1
+        show()
+    end)
+    back.MouseButton1Click:Connect(function()
+        Intro.step = math.max(1, Intro.step - 1)
+        show()
+    end)
+    skip.MouseButton1Click:Connect(function() Intro.endTour() end)
+
+    show()
+end
+
+-- Called at the end of launch: wait out the loading screen, show the
+-- panel, then start the tour for new players.
+function Intro.finishBoot()
+    local gui = PlayerGui:FindFirstChild("FNFInjectorGui")
+    local main = gui and gui:FindFirstChild("Main")
+    if main then main.Visible = false end
+    task.spawn(function()
+        local deadline = os.clock() + 12
+        while not Intro.loadDone and os.clock() < deadline do task.wait(0.05) end
+        if main then
+            main.Visible = true
+            local target = main.Position
+            main.Position = target + UDim2.new(0, 0, 0, 24)
+            TweenService:Create(main, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+                { Position = target }):Play()
+        end
+        if Intro.isNew() then
+            task.wait(0.3)
+            Intro.startTour()
+        end
+    end)
+end
+
+-- ============================================================
+--  VIDEO PLAYER
+--  Plays a video file from your own computer, locally. Roblox
+--  can't accept files dragged in from Windows, so a folder in
+--  your executor's workspace is the drop box: put a .webm in
+--  there, refresh, click it. getcustomasset turns that file into
+--  something Roblox can load on your client only, so nobody
+--  else sees it.
+-- ============================================================
+function Vid.resolveApi()
+    Vid.api = {
+        asset      = findFn("getcustomasset", getcustomasset) or findFn("getsynasset", getsynasset),
+        list       = findFn("listfiles", listfiles),
+        isfile     = findFn("isfile", isfile),
+        isfolder   = findFn("isfolder", isfolder),
+        makefolder = findFn("makefolder", makefolder),
+    }
+    if Vid.api.makefolder then
+        pcall(function()
+            if not (Vid.api.isfolder and Vid.api.isfolder("FNFInjector")) then Vid.api.makefolder("FNFInjector") end
+            if not (Vid.api.isfolder and Vid.api.isfolder(Vid.folder)) then Vid.api.makefolder(Vid.folder) end
+        end)
+    end
+end
+
+local function baseName(path)
+    return (tostring(path):match("[^/\\]+$")) or tostring(path)
+end
+
+-- What's in the drop box? Returns { {path, name, ext}, ... }
+function Vid.listFiles()
+    local out = {}
+    if not Vid.api.list then return out end
+    local ok, files = pcall(Vid.api.list, Vid.folder)
+    if not ok or type(files) ~= "table" then return out end
+    for _, p in ipairs(files) do
+        local name = baseName(p)
+        local ext = (name:match("%.([%w]+)$") or ""):lower()
+        if ext ~= "" then
+            -- normalise to a path relative to the workspace folder
+            table.insert(out, { path = Vid.folder .. "/" .. name, name = name, ext = ext })
+        end
+    end
+    table.sort(out, function(a, b) return a.name:lower() < b.name:lower() end)
+    return out
+end
+
+function Vid.buildPlayer()
+    local old = PlayerGui:FindFirstChild("FNFVideo")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FNFVideo"
+    sg.IgnoreGuiInset = true
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = F.silZ(45)
+    sg.Enabled = false
+    sg.Parent = PlayerGui
+    Vid.gui = sg
+
+    local win = Instance.new("Frame")
+    win.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    win.BorderSizePixel = 0
+    win.Active = true
+    win.Draggable = true
+    win.ClipsDescendants = true
+    win.Parent = sg
+    F.uiCorner(win, UDim.new(0, 10))
+    Vid.window = win
+
+    local vf = Instance.new("VideoFrame")
+    vf.Size = UDim2.new(1, 0, 1, 0)
+    vf.BackgroundTransparency = 1
+    vf.Looped = Vid.looped
+    vf.Volume = Vid.volume
+    vf.Parent = win
+    Vid.frame = vf
+
+    -- slim progress bar along the bottom of the window
+    local barBg = Instance.new("Frame")
+    barBg.AnchorPoint = Vector2.new(0, 1)
+    barBg.Position = UDim2.new(0, 0, 1, 0)
+    barBg.Size = UDim2.new(1, 0, 0, 3)
+    barBg.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    barBg.BackgroundTransparency = 0.8
+    barBg.BorderSizePixel = 0
+    barBg.ZIndex = 3
+    barBg.Parent = win
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, 0, 1, 0)
+    bar.BackgroundColor3 = THEMES[currentThemeName].accent
+    bar.BorderSizePixel = 0
+    bar.ZIndex = 4
+    bar.Parent = barBg
+    Vid.bar = bar
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 22, 0, 22)
+    close.Position = UDim2.new(1, -28, 0, 6)
+    close.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    close.BackgroundTransparency = 0.4
+    close.Text = "X"
+    close.TextColor3 = Color3.fromRGB(255, 255, 255)
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 11
+    close.ZIndex = 5
+    close.Parent = win
+    F.uiCorner(close, UDim.new(1, 0))
+    close.MouseButton1Click:Connect(function() Vid.stop() end)
+
+    RunService.RenderStepped:Connect(function()
+        if not Vid.frame or not Vid.gui.Enabled then return end
+        local len = Vid.frame.TimeLength
+        if len and len > 0 then
+            Vid.bar.Size = UDim2.new(math.clamp(Vid.frame.TimePosition / len, 0, 1), 0, 1, 0)
+            if Vid.timeLbl then
+                Vid.timeLbl.Text = string.format("%d:%02d / %d:%02d",
+                    math.floor(Vid.frame.TimePosition / 60), math.floor(Vid.frame.TimePosition % 60),
+                    math.floor(len / 60), math.floor(len % 60))
+            end
+        end
+    end)
+
+    Vid.applyLayout()
+end
+
+-- Window, fullscreen, or a dim backdrop behind everything.
+function Vid.applyLayout()
+    local win = Vid.window
+    if not win then return end
+    -- The stage draws the characters one layer above the video. Any mode
+    -- that lifts the video higher would cover them, so while the stage is
+    -- on the video is pinned to the bottom, whatever mode is selected.
+    local mode = Vid.stage.on and "BACKDROP" or Vid.display
+    if mode == "FULLSCREEN" then
+        win.AnchorPoint = Vector2.new(0, 0)
+        win.Position = UDim2.new(0, 0, 0, 0)
+        win.Size = UDim2.new(1, 0, 1, 0)
+        win.Draggable = false
+        Vid.gui.DisplayOrder = F.silZ(150)
+    elseif mode == "BACKDROP" then
+        win.AnchorPoint = Vector2.new(0, 0)
+        win.Position = UDim2.new(0, 0, 0, 0)
+        win.Size = UDim2.new(1, 0, 1, 0)
+        win.Draggable = false
+        Vid.gui.DisplayOrder = F.silZ(1)      -- underneath every other panel
+    else
+        win.AnchorPoint = Vector2.new(1, 1)
+        win.Position = UDim2.new(1, -20, 1, -150)
+        win.Size = UDim2.new(0, 480 * Vid.scale, 0, 270 * Vid.scale)
+        win.Draggable = true
+        Vid.gui.DisplayOrder = F.silZ(45)
+    end
+    win.BackgroundTransparency = Vid.stage.on and 0 or Vid.opacity
+    if Vid.frame then Vid.frame.ImageTransparency = Vid.opacity end
+    -- and the character layer always sits directly above the video
+    if Vid.stage.gui then Vid.stage.gui.DisplayOrder = Vid.gui.DisplayOrder + 1 end
+    if Vid.syncModes then Vid.syncModes() end
+end
+
+function Vid.setStatus(text, color)
+    if Vid.statusLbl then
+        Vid.statusLbl.Text = text
+        Vid.statusLbl.TextColor3 = color or Color3.fromRGB(160, 160, 180)
+    end
+end
+
+-- Load and play. `source` is a file path in the drop box, or a Roblox video ID.
+function Vid.play(source, isAssetId)
+    if not Vid.gui or not Vid.gui.Parent then Vid.buildPlayer() end
+    local content
+    if isAssetId then
+        content = "rbxassetid://" .. source
+    else
+        if not Vid.api.asset then
+            Vid.setStatus("Your executor has no getcustomasset, so local files can't load.", Color3.fromRGB(255, 120, 90))
+            F.notify("Local videos need getcustomasset", "error")
+            return
+        end
+        local ext = (tostring(source):match("%.([%w]+)$") or ""):lower()
+        if ext ~= "webm" then
+            Vid.setStatus("That's a ." .. ext .. " file. Roblox only plays .webm — convert it first.",
+                Color3.fromRGB(255, 170, 80))
+            F.notify("Convert to .webm first", "warn")
+            return
+        end
+        local ok, res = pcall(Vid.api.asset, source)
+        if not ok or not res then
+            Vid.setStatus("getcustomasset failed: " .. tostring(res), Color3.fromRGB(255, 120, 90))
+            return
+        end
+        content = res
+        Vid.lastFile = source
+    end
+
+    local vf = Vid.frame
+    pcall(function() vf:Pause() end)
+    vf.Video = content
+    vf.Looped = Vid.looped
+    vf.Volume = Vid.volume
+    Vid.current = source
+    Vid.gui.Enabled = true
+    Vid.applyLayout()
+    Vid.setStatus("loading " .. baseName(source) .. "...", Color3.fromRGB(0, 200, 255))
+
+    -- give it a few seconds to load before calling it a failure
+    task.spawn(function()
+        local deadline = os.clock() + 6
+        while os.clock() < deadline and vf.Video == content and not vf.IsLoaded do task.wait(0.1) end
+        if vf.Video ~= content then return end
+        if vf.IsLoaded then
+            pcall(function() vf:Play() end)
+            Vid.setStatus("playing " .. baseName(source), Color3.fromRGB(120, 230, 150))
+        else
+            Vid.setStatus("Roblox couldn't load it. Try re-exporting as VP9 .webm, or a shorter clip.",
+                Color3.fromRGB(255, 120, 90))
+        end
+    end)
+end
+
+function Vid.togglePause()
+    local vf = Vid.frame
+    if not vf or not Vid.current then return end
+    if vf.Playing then pcall(function() vf:Pause() end) else pcall(function() vf:Play() end) end
+end
+
+function Vid.restart()
+    local vf = Vid.frame
+    if not vf or not Vid.current then return end
+    vf.TimePosition = 0
+    pcall(function() vf:Play() end)
+end
+
+function Vid.stop()
+    if Vid.frame then pcall(function() Vid.frame:Pause() end) end
+    if Vid.gui and not Vid.stage.on then Vid.gui.Enabled = false end
+    if Vid.stage.on and Vid.frame then Vid.frame.Video = "" end   -- stage stays, background goes black
+    Vid.current = nil
+    Vid.setStatus("stopped")
+end
+
+-- ============================================================
+--  BLACK SCREEN FADE
+--  Smooth to black, a beat of darkness, then a slow fade back.
+--  Pressing it again mid-fade drops you straight back to black.
+-- ============================================================
+function Vid.blackout()
+    if not Vid.boGui or not Vid.boGui.Parent then
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "FNFBlackout"
+        sg.IgnoreGuiInset = true
+        sg.ResetOnSpawn = false
+        sg.DisplayOrder = F.silZ(185)
+        sg.Parent = PlayerGui
+        local f = Instance.new("Frame")
+        f.Name = "Black"
+        f.Size = UDim2.new(1, 0, 1, 0)
+        f.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.Parent = sg
+        Vid.boGui = sg
+    end
+    local f = Vid.boGui.Black
+    Vid.boToken = Vid.boToken + 1
+    local tok = Vid.boToken
+
+    TweenService:Create(f, TweenInfo.new(math.max(Vid.boFadeIn, 0.01), Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+        { BackgroundTransparency = 0 }):Play()
+    task.delay(Vid.boFadeIn + Vid.boHold, function()
+        if Vid.boToken ~= tok then return end
+        TweenService:Create(f, TweenInfo.new(math.max(Vid.boFadeOut, 0.05), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+            { BackgroundTransparency = 1 }):Play()
+    end)
+end
+
+-- ============================================================
+--  VIDEO STAGE
+--  The video plays full screen and hides the whole world. You
+--  and your opponent are redrawn on top of it: exact copies in
+--  a full-screen viewport, using your real camera, with every
+--  body part copying its real position every frame. Normal
+--  colours, no black fill. Nobody else is drawn at all.
+-- ============================================================
+local function relPath(inst, root)
+    local parts = {}
+    local cur = inst
+    while cur and cur ~= root do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, "/")
+end
+
+local function countParts(char)
+    local n = 0
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then n = n + 1 end
+    end
+    return n
+end
+
+-- A still copy of a character whose parts get placed by hand every frame.
+function Vid.stageClone(char)
+    if not char or not char.Parent or not Vid.stage.vp then return nil end
+    local was = char.Archivable
+    char.Archivable = true
+    local ok, clone = pcall(function() return char:Clone() end)
+    char.Archivable = was
+    if not ok or not clone then return nil end
+
+    -- Joints would drag whole limbs around when we set one part's CFrame,
+    -- so every part is freed and positioned on its own instead.
+    local strip = {}
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d:IsA("LuaSourceContainer") or d:IsA("JointInstance") or d:IsA("WeldConstraint")
+            or d:IsA("Constraint") or d:IsA("Sound") then
+            table.insert(strip, d)
+        end
+    end
+    for _, d in ipairs(strip) do d:Destroy() end
+
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end)
+        pcall(function() hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff end)
+        pcall(function() hum.RequiresNeck = false end)
+        pcall(function() hum.BreakJointsOnDeath = false end)
+    end
+
+    -- pair every clone part with the real part at the same place in the tree
+    local real = {}
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then real[relPath(p, char)] = p end
+    end
+    local map = {}
+    for _, p in ipairs(clone:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.Anchored = true
+            p.CanCollide = false
+            local r = real[relPath(p, clone)]
+            if r then table.insert(map, { r, p }) end
+        end
+    end
+
+    clone.Name = "StageCopy"
+    clone.Parent = Vid.stage.vp
+    return { char = char, clone = clone, map = map, count = countParts(char) }
+end
+
+function Vid.stageDrop(entry)
+    if entry and entry.clone then pcall(function() entry.clone:Destroy() end) end
+end
+
+-- Keep the copies pointed at the right characters: respawns, a new
+-- opponent, or an outfit change all trigger a fresh copy.
+function Vid.stageRefresh()
+    local st = Vid.stage
+    local wantMe = character
+    local wantOpp = currentTarget and currentTarget.Character or nil
+
+    for _, key in ipairs({ "me", "opp" }) do
+        local want = (key == "me") and wantMe or wantOpp
+        local e = st[key]
+        local stale = e and (e.char ~= want or not e.char.Parent
+            or countParts(e.char) ~= e.count or #e.map == 0)
+        if stale or (not e and want) then
+            Vid.stageDrop(e)
+            st[key] = want and Vid.stageClone(want) or nil
+        end
+    end
+end
+
+function Vid.stageStep()
+    local st = Vid.stage
+    if not st.on or not st.vp then return end
+
+    -- same camera as the real one, so the copies line up exactly
+    local cam = Workspace.CurrentCamera
+    if cam and st.cam then
+        st.cam.CFrame = cam.CFrame
+        st.cam.FieldOfView = cam.FieldOfView
+    end
+
+    for _, key in ipairs({ "me", "opp" }) do
+        local e = st[key]
+        if e then
+            for _, pair in ipairs(e.map) do
+                local r, c = pair[1], pair[2]
+                if r.Parent then
+                    c.CFrame = r.CFrame
+                end
+            end
+        end
+    end
+end
+
+function Vid.startStage()
+    local st = Vid.stage
+    if st.on then return end
+    st.on = true
+    st.prevDisplay = Vid.display
+
+    -- the video layer: full screen, behind the panels
+    if not Vid.gui or not Vid.gui.Parent then Vid.buildPlayer() end
+    Vid.display = "BACKDROP"
+    Vid.gui.Enabled = true
+    Vid.applyLayout()
+    if Vid.window then Vid.window.BackgroundTransparency = 0 end   -- solid black if nothing's playing
+    if not Vid.current then F.notify("Stage on — play a video from the list for the background", "info") end
+
+    -- the character layer, one step above the video
+    local old = PlayerGui:FindFirstChild("FNFVideoStage")
+    if old then old:Destroy() end
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FNFVideoStage"
+    sg.IgnoreGuiInset = true          -- must match the real camera's full screen
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = (Vid.gui and Vid.gui.DisplayOrder or 1) + 1
+    sg.Parent = PlayerGui
+    st.gui = sg
+
+    local vp = Instance.new("ViewportFrame")
+    vp.Size = UDim2.new(1, 0, 1, 0)
+    vp.BackgroundTransparency = 1
+    vp.Ambient = Color3.fromRGB(150, 150, 160)
+    vp.LightColor = Color3.fromRGB(255, 255, 255)
+    local okSun, sun = pcall(function() return game:GetService("Lighting"):GetSunDirection() end)
+    vp.LightDirection = okSun and -sun or Vector3.new(-0.5, -1, -0.4)
+    vp.Parent = sg
+    st.vp = vp
+
+    local cam = Instance.new("Camera")
+    cam.Parent = vp
+    vp.CurrentCamera = cam
+    st.cam = cam
+
+    Vid.stageRefresh()
+    Vid.applyLayout()
+
+    -- run right after the camera finishes, so nothing lags a frame
+    pcall(function() RunService:UnbindFromRenderStep("FNFVideoStage") end)
+    RunService:BindToRenderStep("FNFVideoStage", Enum.RenderPriority.Camera.Value + 1, Vid.stageStep)
+
+    st.watch = task.spawn(function()
+        while st.on do
+            task.wait(0.5)
+            if st.on then
+                pcall(Vid.stageRefresh)
+                -- real fades only (like the invisible root part), never the
+                -- camera's zoomed-in hiding, which would erase your own copy
+                for _, key in ipairs({ "me", "opp" }) do
+                    local e = st[key]
+                    if e then
+                        for _, pair in ipairs(e.map) do
+                            if pair[1].Parent then pair[2].Transparency = pair[1].Transparency end
+                        end
+                    end
+                end
+                if Vid.refreshStageUI then Vid.refreshStageUI() end
+            end
+        end
+    end)
+
+    if Vid.refreshStageUI then Vid.refreshStageUI() end
+    if not currentTarget then F.notify("No opponent set — only you are shown. Pick one in the CAM tab.", "warn") end
+end
+
+function Vid.stopStage()
+    local st = Vid.stage
+    if not st.on then return end
+    st.on = false
+    pcall(function() RunService:UnbindFromRenderStep("FNFVideoStage") end)
+    Vid.stageDrop(st.me); Vid.stageDrop(st.opp)
+    st.me, st.opp = nil, nil
+    if st.gui then st.gui:Destroy() end
+    st.gui, st.vp, st.cam = nil, nil, nil
+
+    Vid.display = st.prevDisplay or "WINDOW"
+    if Vid.window then Vid.window.BackgroundTransparency = Vid.opacity end
+    if not Vid.current and Vid.gui then Vid.gui.Enabled = false end
+    Vid.applyLayout()
+    if Vid.refreshStageUI then Vid.refreshStageUI() end
+end
+
+-- ============================================================
+--  RESULT — win / lose
+--  WIN plays a cheer. LOSE sits you down and launches you. Both
+--  are manual: you decide the outcome with a key or a button.
+-- ============================================================
+function Result.mph(studsPerSec)
+    return studsPerSec * 0.28 * 2.23694   -- ~0.28 m per stud
+end
+
+-- Your avatar's own built-in animation (cheer, sit...), which plays
+-- in any game because Roblox owns it.
+function Result.defaultAnim(slot)
+    local animate = character and character:FindFirstChild("Animate")
+    local folder = animate and animate:FindFirstChild(slot)
+    local anim = folder and folder:FindFirstChildOfClass("Animation")
+    return anim and anim.AnimationId or nil
+end
+
+function Result.loadTrack(customId, slot)
+    if not animator then return nil end
+    local id
+    if customId and customId ~= "" then
+        id = "rbxassetid://" .. customId
+    else
+        id = Result.defaultAnim(slot)
+    end
+    if not id then return nil end
+    local ok, t = pcall(function()
+        local a = Instance.new("Animation")
+        a.AnimationId = id
+        return animator:LoadAnimation(a)
+    end)
+    if ok and t then
+        t.Priority = Enum.AnimationPriority.Action4   -- over every pose and emote
+        return t
+    end
+    return nil
+end
+
+-- anything of ours currently posing you gets out of the way
+function Result.clearPoses()
+    if Hold.track then Hold.clear(false) end
+    for _, t in pairs(animTracks) do pcall(function() t:Stop(0.1) end) end
+    if cutterTrack and cutterTrack.IsPlaying then pcall(function() cutterTrack:Stop(0.1) end) end
+end
+
+function Result.showBanner(text, color)
+    if not Result.banner then return end
+    if not Result.gui or not Result.gui.Parent then
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "FNFResult"
+        sg.IgnoreGuiInset = true
+        sg.ResetOnSpawn = false
+        sg.DisplayOrder = F.silZ(170)
+        sg.Parent = PlayerGui
+        local l = Instance.new("TextLabel")
+        l.AnchorPoint = Vector2.new(0.5, 0.5)
+        l.Position = UDim2.new(0.5, 0, 0.32, 0)
+        l.Size = UDim2.new(1, 0, 0, 90)
+        l.BackgroundTransparency = 1
+        l.Font = Enum.Font.GothamBlack
+        l.TextSize = 72
+        l.TextStrokeTransparency = 0.2
+        l.TextTransparency = 1
+        l.Parent = sg
+        Result.gui, Result.bannerLbl = sg, l
+    end
+    local l = Result.bannerLbl
+    l.Text = text
+    l.TextColor3 = color
+    l.TextTransparency = 0
+    l.TextStrokeTransparency = 0.2
+    l.TextSize = 120
+    l.Rotation = math.random(-6, 6)
+    TweenService:Create(l, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { TextSize = 72, Rotation = 0 }):Play()
+    task.delay(2, function()
+        if l.Text == text then
+            TweenService:Create(l, TweenInfo.new(0.5), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+        end
+    end)
+end
+
+function Result.win()
+    if not character or not animator then return end
+    Result.token = Result.token + 1
+    local tok = Result.token
+    Result.clearPoses()
+    if Result.winTrack then pcall(function() Result.winTrack:Stop(0.1) end) end
+
+    local t = Result.loadTrack(Result.cheerId, "cheer")
+    if not t then
+        F.notify("No cheer found — paste a cheer animation ID in the RESULT tab", "warn")
+    else
+        t.Looped = Result.cheerLoop
+        t:Play(0.1)
+        Result.winTrack = t
+        if Result.cheerLoop then
+            task.delay(Result.cheerTime, function()
+                if Result.token == tok and t.IsPlaying then t:Stop(0.3) end
+            end)
+        end
+    end
+
+    Result.showBanner("YOU WIN!", Color3.fromRGB(255, 215, 70))
+    FNFCamera:DoubleNoteZoom(0.8)
+    if Chaos.enabled then Chaos.hit(1.2) end
+end
+
+function Result.lose()
+    local char = character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then return end
+    Result.token = Result.token + 1
+    local tok = Result.token
+    Result.clearPoses()
+
+    -- anything of ours that pins your body has to let go first
+    if Ride.enabled then Ride.unlock("lost the battle") end
+    root.Anchored = false
+
+    -- sitting pose
+    if Result.sitTrack then pcall(function() Result.sitTrack:Stop(0) end) end
+    local sit = Result.loadTrack(Result.sitId, "sit")
+    if sit then
+        sit.Looped = true
+        sit:Play(0.05)
+        Result.sitTrack = sit
+    end
+
+    -- hand the body to physics so the humanoid doesn't cancel the launch
+    hum.PlatformStand = true
+
+    -- which way you go flying
+    local dir
+    local oppRoot = currentTarget and currentTarget.Character
+        and currentTarget.Character:FindFirstChild("HumanoidRootPart")
+    if Result.direction == "AWAY" and oppRoot then
+        dir = root.Position - oppRoot.Position
+    elseif Result.direction == "RANDOM" then
+        local a = math.random() * math.pi * 2
+        dir = Vector3.new(math.cos(a), 0, math.sin(a))
+    else
+        dir = -root.CFrame.LookVector
+    end
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    dir = (dir.Magnitude > 1e-3) and dir.Unit or -root.CFrame.LookVector
+
+    local vel = dir * Result.flingSpeed + Vector3.new(0, Result.lift, 0)
+    root.AssemblyLinearVelocity = vel
+    local axis = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5)
+    if axis.Magnitude < 1e-3 then axis = Vector3.new(1, 0, 0) end
+    root.AssemblyAngularVelocity = axis.Unit * Result.spin
+
+    -- keep pushing for a split second so ground friction can't eat the launch
+    local att = Instance.new("Attachment")
+    att.Parent = root
+    local lv = Instance.new("LinearVelocity")
+    lv.Attachment0 = att
+    lv.RelativeTo = Enum.ActuatorRelativeTo.World
+    lv.VectorVelocity = vel
+    lv.MaxForce = math.huge
+    lv.Parent = root
+    task.delay(0.12, function() lv:Destroy(); att:Destroy() end)
+
+    Result.showBanner("YOU LOSE", Color3.fromRGB(255, 70, 70))
+    if Chaos.enabled then Chaos.bigImpact(1.2) end
+
+    -- recover
+    task.delay(Result.getUpAfter, function()
+        if Result.token ~= tok then return end
+        if sit then pcall(function() sit:Stop(0.25) end) end
+        if hum.Parent and hum.Health > 0 then
+            hum.PlatformStand = false
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        end
+    end)
 end
 
 -- ============================================================
@@ -4410,7 +5521,7 @@ end
 -- ============================================================
 local SCRIPT_TAG_ATTR     = "FNFInjectorLoaded"
 local SCRIPT_VERSION_ATTR = "FNFInjectorVersion"
-local INJECTOR_VERSION    = "6.2"
+INJECTOR_VERSION = "6.2"
 local MATCH_REMOTE_NAME   = "FNFMatchRemote"
 
 local matchRemote = nil
@@ -5157,6 +6268,39 @@ function F.cutterLoadTrack()
     return cutterTrack
 end
 
+-- Walk the slice back to its first frame, then hold it there.
+-- Stepped by hand rather than with a negative speed, so the timing is
+-- exact and it can't overshoot past the start of the clip.
+function F.cutterReverse(track, gen)
+    if not track or not track.IsPlaying then return end
+    local from = track.TimePosition
+    local to = Cut.sliceStart
+    local dur = math.max(Cut.returnTime, 0.01)
+    track:AdjustSpeed(0)
+    task.spawn(function()
+        local t0 = os.clock()
+        while gen == Cut.sliceGen and track.IsPlaying do
+            local k = math.clamp((os.clock() - t0) / dur, 0, 1)
+            k = k * k * (3 - 2 * k)            -- ease in and out
+            track.TimePosition = from + (to - from) * k
+            if k >= 1 then break end
+            RunService.RenderStepped:Wait()
+        end
+        if gen ~= Cut.sliceGen or not track.IsPlaying then return end
+        -- back at the original pose: pin it exactly on that frame
+        track:AdjustSpeed(0)
+        track.TimePosition = to
+        if Cut.holdAfterReturn then
+            -- Pose Hold decides how long (its timer, or until the next note).
+            -- With Pose Hold off it simply stays here until you play again.
+            if Hold.enabled and Hold.cutter then Hold.start(track, "slice") end
+        else
+            if Hold.track == track then Hold.detach() end
+            track:Stop(BLEND_OUT)
+        end
+    end)
+end
+
 function F.cutterPlaySlice(dir)
     if not animator then return end
     local slice = cutterSlices[dir]
@@ -5186,6 +6330,7 @@ function F.cutterPlaySlice(dir)
     local a, b = slice.start, slice.stop
     if b < a then a, b = b, a end
     local span = b - a
+    Cut.sliceStart = math.max(0, a)
 
     -- already playing: don't call Play again, which restarts and hitches.
     -- Just move the playhead.
@@ -5196,6 +6341,12 @@ function F.cutterPlaySlice(dir)
         -- instant: land on the pose this frame
         cutterTrack:AdjustSpeed(0)
         cutterTrack.TimePosition = math.max(0, b)
+        if Cut.reverse == "AUTO" then
+            local track = cutterTrack
+            task.delay(Cut.returnPause, function()
+                if gen == Cut.sliceGen then F.cutterReverse(track, gen) end
+            end)
+        end
         return
     end
 
@@ -5215,11 +6366,24 @@ function F.cutterPlaySlice(dir)
             end
             RunService.RenderStepped:Wait()
         end
+        -- AUTO: it landed, now take it home
+        if Cut.reverse == "AUTO" and gen == Cut.sliceGen and track.IsPlaying then
+            task.wait(Cut.returnPause)
+            if gen == Cut.sliceGen then F.cutterReverse(track, gen) end
+        end
     end)
 end
 
 function F.cutterStopSlice()
     if cutterTrack and cutterTrack.IsPlaying then
+        -- AUTO is already on its way home; letting go changes nothing
+        if Cut.reverse == "AUTO" then return end
+        -- RELEASE: going back is what letting go means
+        if Cut.reverse == "RELEASE" then
+            Cut.sliceGen = Cut.sliceGen + 1       -- stop the forward watcher
+            F.cutterReverse(cutterTrack, Cut.sliceGen)
+            return
+        end
         -- a slice is short by definition, so the cutter only checks the toggle
         if Hold.enabled and Hold.cutter then
             -- don't freeze mid-slice: the slice watcher carries it to its
@@ -5588,7 +6752,19 @@ function F.onInput(input, gameProcessed)
         Boss.toggle()
     end
 
-    -- Hold notes on/off
+    -- Win / lose
+    if input.KeyCode and input.UserInputState == Enum.UserInputState.Begin then
+        if input.KeyCode.Name == Result.winKey then Result.win()
+        elseif input.KeyCode.Name == Result.loseKey then Result.lose() end
+    end
+
+    -- Black screen fade
+    if input.KeyCode and input.KeyCode.Name == Vid.boKey
+        and input.UserInputState == Enum.UserInputState.Begin then
+        Vid.blackout()
+    end
+
+    -- Hold streaks on/off
     if input.KeyCode and input.KeyCode.Name == Notes.key
         and input.UserInputState == Enum.UserInputState.Begin then
         Notes.setEnabled(not Notes.enabled)
@@ -5758,6 +6934,9 @@ function F.setupCharacter(char)
     if Split.enabled then Split.refreshClones() end
     if Boss.active then Boss.exit() end
     if Ride.enabled then Ride.unlock("respawned") end
+    Result.token = Result.token + 1
+    Result.winTrack, Result.sitTrack = nil, nil
+    if Vid.stage.on then task.delay(0.5, function() pcall(Vid.stageRefresh) end) end
     Cut.tracks = {}
     Cut.trackOwner = nil
     cutterTrack = nil
@@ -6496,8 +7675,8 @@ local EASE = {
 }
 local EASE_ORDER = { "SineOut", "SineInOut", "BackOut", "Snap", "Linear" }
 
-local SPACING = {
-    enabled     = true,
+SPACING = {
+    enabled     = false,
     stepIn      = 2.2,    -- studs you close on your first note
     bothBonus   = 1.3,    -- extra studs when you're both singing
     stepTime    = 0.3,    -- how long the step in takes
@@ -7876,6 +9055,65 @@ function F.buildTab_Cutter(pages)
         reachLbl.Text = string.format("%.2fs", v)
     end)
 
+    -- ── reverse ──
+    local rvY = rY + 124
+    F.makeLabel(pg, "PLAY IT BACK", UDim2.new(0,8,0,rvY), UDim2.new(0,200,0,18),
+        C(160,160,160), Enum.TextXAlignment.Left, 10)
+    local rvHelp = {
+        OFF     = "Stays on the pose (Pose Hold still applies).",
+        AUTO    = "Lands, pauses, then goes back to its start on its own.",
+        RELEASE = "Holds while you hold the key, goes back when you let go.",
+    }
+    local rvBtn = F.makeBtn(pg, "", UDim2.new(0,8,0,rvY+20), UDim2.new(0,160,0,26), C(35,35,55), nil, 10)
+    local rvNote = F.makeLabel(pg, "", UDim2.new(0,176,0,rvY+20), UDim2.new(1,-184,0,26),
+        C(120,120,140), Enum.TextXAlignment.Left, 9)
+    rvNote.TextWrapped = true
+    local function syncRv()
+        rvBtn.Text = "REVERSE: " .. (Cut.reverse == "RELEASE" and "ON RELEASE" or Cut.reverse)
+        rvBtn.BackgroundColor3 = (Cut.reverse == "OFF") and C(35,35,55) or C(255,160,40)
+        rvNote.Text = rvHelp[Cut.reverse] or ""
+    end
+    rvBtn.MouseButton1Click:Connect(function()
+        local order = { "OFF", "AUTO", "RELEASE" }
+        Cut.reverse = order[((table.find(order, Cut.reverse) or 1) % #order) + 1]
+        syncRv()
+    end)
+    syncRv()
+
+    local rvRows = {
+        { key = "returnPause", label = "PAUSE ON THE POSE (AUTO)", min = 0,    max = 1.5, fmt = "%.2fs" },
+        { key = "returnTime",  label = "TIME TO GO BACK",          min = 0.03, max = 1.5, fmt = "%.2fs" },
+    }
+    for i, s in ipairs(rvRows) do
+        local ry = rvY + 54 + (i-1) * 42
+        F.makeLabel(pg, s.label, UDim2.new(0,8,0,ry), UDim2.new(0,240,0,18), C(160,160,160), Enum.TextXAlignment.Left, 10)
+        local v = F.makeLabel(pg, string.format(s.fmt, Cut[s.key]), UDim2.new(0,306,0,ry), UDim2.new(0,90,0,18),
+            C(255,80,180), Enum.TextXAlignment.Right, 10)
+        F.regText(v)
+        local ck, cf = s.key, s.fmt
+        F.makeSlider(pg, UDim2.new(0,8,0,ry+20), UDim2.new(1,-16,0,12), s.min, s.max, Cut[s.key], function(val)
+            Cut[ck] = val
+            v.Text = string.format(cf, val)
+        end)
+    end
+
+    local haY = rvY + 54 + #rvRows * 42
+    local haBtn = F.makeBtn(pg, "", UDim2.new(0,8,0,haY), UDim2.new(0,190,0,26), C(35,35,55), nil, 9)
+    local haNote = F.makeLabel(pg, "", UDim2.new(0,206,0,haY), UDim2.new(1,-214,0,26),
+        C(120,120,140), Enum.TextXAlignment.Left, 9)
+    haNote.TextWrapped = true
+    local function syncHa()
+        haBtn.Text = Cut.holdAfterReturn and "AFTER GOING BACK: HOLD" or "AFTER GOING BACK: IDLE"
+        haBtn.BackgroundColor3 = Cut.holdAfterReturn and C(255,160,40) or C(35,35,55)
+        haNote.Text = Cut.holdAfterReturn and "Stays on the start frame. Pose Hold sets how long."
+            or "Blends out to idle once it's back."
+    end
+    haBtn.MouseButton1Click:Connect(function()
+        Cut.holdAfterReturn = not Cut.holdAfterReturn
+        syncHa()
+    end)
+    syncHa()
+
     Cut.startLoop()
     task.defer(function()
         Cut.buildClone()
@@ -8738,8 +9976,10 @@ function F.buildTab_Cam(pages)
 
     -- settle controls
     local cpSetY = cpY + 58 + math.ceil(#CAM_PRESET_ORDER / 3) * 34 + 8
-    local cpSettleBtn = F.makeBtn(pgCam, "SETTLE WHEN QUIET: ON", UDim2.new(0,8,0,cpSetY),
-        UDim2.new(0,220,0,26), Color3.fromRGB(60,190,120), nil, 9)
+    local cpSettleBtn = F.makeBtn(pgCam,
+        FNFCamera.settleEnabled and "SETTLE WHEN QUIET: ON" or "SETTLE WHEN QUIET: OFF",
+        UDim2.new(0,8,0,cpSetY), UDim2.new(0,220,0,26),
+        FNFCamera.settleEnabled and Color3.fromRGB(60,190,120) or Color3.fromRGB(190,50,50), nil, 9)
     cpSettleBtn.MouseButton1Click:Connect(function()
         FNFCamera.settleEnabled = not FNFCamera.settleEnabled
         cpSettleBtn.Text = FNFCamera.settleEnabled and "SETTLE WHEN QUIET: ON" or "SETTLE WHEN QUIET: OFF"
@@ -9724,6 +10964,410 @@ function F.buildTab_FX(pages)
     end)
 end
 
+function F.buildTab_Video(pages)
+    local pg = pages["🎞 VIDEO"]
+    local C = Color3.fromRGB
+
+    local title = F.makeLabel(pg, "VIDEO PLAYER", UDim2.new(0,8,0,6), UDim2.new(1,-16,0,22),
+        C(255,80,180), Enum.TextXAlignment.Left, 14)
+    title.Font = Enum.Font.GothamBlack
+    F.regText(title)
+    F.makeLabel(pg, "Plays videos from your computer. Only you can see them.",
+        UDim2.new(0,8,0,28), UDim2.new(1,-16,0,16), C(130,130,150), Enum.TextXAlignment.Left, 9)
+
+    -- ── what this executor can do ──
+    local caps = F.makeLabel(pg, "", UDim2.new(0,8,0,48), UDim2.new(1,-16,0,16),
+        C(160,160,180), Enum.TextXAlignment.Left, 10)
+    local function refreshCaps()
+        local a = Vid.api.asset and "YES" or "NO"
+        local l = Vid.api.list and "YES" or "NO"
+        caps.Text = "local video support: " .. a .. "   |   folder listing: " .. l
+        caps.TextColor3 = Vid.api.asset and C(120,230,150) or C(255,120,90)
+    end
+    refreshCaps()
+
+    -- ── the drop box ──
+    F.makeDivider(pg, 70, THEMES[currentThemeName].accent)
+    local dropHdr = F.makeLabel(pg, "YOUR VIDEOS", UDim2.new(0,8,0,76), UDim2.new(0,160,0,18),
+        C(255,80,180), Enum.TextXAlignment.Left, 11)
+    dropHdr.Font = Enum.Font.GothamBold
+    F.regText(dropHdr)
+
+    local howTo = F.makeLabel(pg,
+        "Drag a .webm file into this folder in Windows Explorer, then press REFRESH:\n"
+        .. "your executor's  workspace / " .. Vid.folder,
+        UDim2.new(0,8,0,96), UDim2.new(1,-16,0,32), C(200,200,215), Enum.TextXAlignment.Left, 9)
+    howTo.TextWrapped = true
+
+    local refresh = F.makeBtn(pg, "REFRESH", UDim2.new(1,-100,0,74), UDim2.new(0,92,0,22), C(70,120,255), nil, 9)
+
+    local list = Instance.new("ScrollingFrame")
+    list.Size = UDim2.new(1,-16,0,130); list.Position = UDim2.new(0,8,0,132)
+    list.BackgroundColor3 = C(12,11,18); list.BackgroundTransparency = 0.25
+    list.BorderSizePixel = 0; list.ScrollBarThickness = 3
+    list.CanvasSize = UDim2.new(0,0,0,0); list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.Parent = pg
+    F.uiCorner(list, UDim.new(0,8))
+    local ll = Instance.new("UIListLayout"); ll.Padding = UDim.new(0,3); ll.Parent = list
+    local lp = Instance.new("UIPadding")
+    lp.PaddingTop = UDim.new(0,4); lp.PaddingLeft = UDim.new(0,4); lp.PaddingRight = UDim.new(0,4)
+    lp.Parent = list
+
+    local function row(text, color, order)
+        local l = F.makeLabel(list, text, UDim2.new(0,0,0,0), UDim2.new(1,-8,0,0),
+            color, Enum.TextXAlignment.Left, 9)
+        l.AutomaticSize = Enum.AutomaticSize.Y
+        l.TextWrapped = true
+        l.LayoutOrder = order
+        return l
+    end
+
+    local function fill()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("GuiObject") then c:Destroy() end
+        end
+        if not Vid.api.list then
+            row("Your executor can't list folders. Type the file name below instead.", C(255,170,80), 1)
+            return
+        end
+        local files = Vid.listFiles()
+        if #files == 0 then
+            row("Nothing here yet. Drop a .webm into the folder above and press REFRESH.", C(140,140,160), 1)
+            return
+        end
+        for i, f in ipairs(files) do
+            local playable = (f.ext == "webm")
+            local b = F.makeBtn(list,
+                (playable and "▶  " or "⚠  ") .. f.name .. (playable and "" or "   (convert to .webm)"),
+                UDim2.new(0,0,0,0), UDim2.new(1,-8,0,26),
+                playable and C(34,32,48) or C(55,35,30), nil, 10)
+            b.TextXAlignment = Enum.TextXAlignment.Left
+            b.LayoutOrder = i
+            local pad = Instance.new("UIPadding"); pad.PaddingLeft = UDim.new(0,10); pad.Parent = b
+            local path = f.path
+            b.MouseButton1Click:Connect(function() Vid.play(path) end)
+        end
+    end
+    refresh.MouseButton1Click:Connect(function()
+        Vid.resolveApi(); refreshCaps(); fill()
+    end)
+    fill()
+
+    -- ── manual entry: a file name, or a Roblox video ID ──
+    local manual = F.makeBox(pg, UDim2.new(0,8,0,270), UDim2.new(1,-114,0,28),
+        "file name (clip.webm) or a Roblox video ID", Vid.lastFile ~= "" and Vid.lastFile:match("[^/\\]+$") or "")
+    local manualGo = F.makeBtn(pg, "PLAY", UDim2.new(1,-100,0,270), UDim2.new(0,92,0,28), C(60,190,120), nil, 11)
+    manualGo.MouseButton1Click:Connect(function()
+        local t = manual.Text:gsub("^%s+", ""):gsub("%s+$", "")
+        if t == "" then return end
+        if t:match("^%d+$") then
+            Vid.play(t, true)                    -- a Roblox-hosted video
+        else
+            local path = t:find("/") and t or (Vid.folder .. "/" .. t)
+            Vid.play(path)
+        end
+    end)
+
+    Vid.statusLbl = F.makeLabel(pg, "pick a video", UDim2.new(0,8,0,302), UDim2.new(1,-16,0,28),
+        C(160,160,180), Enum.TextXAlignment.Left, 10)
+    Vid.statusLbl.TextWrapped = true
+
+    -- ── transport ──
+    local trY = 334
+    local function tb(txt, x, w, col, fn)
+        local b = F.makeBtn(pg, txt, UDim2.new(0,x,0,trY), UDim2.new(0,w,0,28), col, nil, 10)
+        b.MouseButton1Click:Connect(fn)
+        return b
+    end
+    tb("PLAY / PAUSE", 8, 126, C(60,190,120), Vid.togglePause)
+    tb("RESTART", 140, 90, C(45,40,60), Vid.restart)
+    tb("STOP", 236, 70, C(190,50,50), Vid.stop)
+    local loopB
+    loopB = tb(Vid.looped and "LOOP: ON" or "LOOP: OFF", 312, 84, Vid.looped and C(70,120,255) or C(45,40,60), function()
+        Vid.looped = not Vid.looped
+        if Vid.frame then Vid.frame.Looped = Vid.looped end
+        loopB.Text = Vid.looped and "LOOP: ON" or "LOOP: OFF"
+        loopB.BackgroundColor3 = Vid.looped and C(70,120,255) or C(45,40,60)
+    end)
+    Vid.timeLbl = F.makeLabel(pg, "", UDim2.new(0,8,0,trY+32), UDim2.new(1,-16,0,16),
+        C(200,200,215), Enum.TextXAlignment.Left, 10)
+    Vid.timeLbl.Font = Enum.Font.Code
+
+    -- ── display mode ──
+    local dY = trY + 56
+    F.makeLabel(pg, "SHOW IT AS", UDim2.new(0,8,0,dY), UDim2.new(1,-16,0,16),
+        C(160,160,160), Enum.TextXAlignment.Left, 10)
+    local modes = { { "WINDOW", "Window" }, { "FULLSCREEN", "Fullscreen" }, { "BACKDROP", "Backdrop" } }
+    local modeBtns = {}
+    local function syncModes()
+        local shown = Vid.stage.on and "BACKDROP" or Vid.display
+        for k, b in pairs(modeBtns) do
+            b.BackgroundColor3 = (k == shown) and C(255,80,180) or C(35,35,55)
+            b.AutoButtonColor = not Vid.stage.on
+        end
+    end
+    Vid.syncModes = syncModes
+    for i, m in ipairs(modes) do
+        local b = F.makeBtn(pg, m[2], UDim2.new(0, 8 + (i-1) * 132, 0, dY + 20), UDim2.new(0,126,0,26), C(35,35,55), nil, 10)
+        modeBtns[m[1]] = b
+        b.MouseButton1Click:Connect(function()
+            if Vid.stage.on then
+                F.notify("The stage keeps the video as the backdrop — turn it off to change this", "info")
+                return
+            end
+            Vid.display = m[1]; syncModes(); Vid.applyLayout()
+        end)
+    end
+    syncModes()
+    F.makeLabel(pg, "Backdrop plays full screen behind every other panel.",
+        UDim2.new(0,8,0,dY+50), UDim2.new(1,-16,0,14), C(120,120,140), Enum.TextXAlignment.Left, 9)
+
+    local sliders = {
+        { key = "volume",  label = "VOLUME",          min = 0,   max = 1,   fmt = "%.2f" },
+        { key = "opacity", label = "SEE-THROUGH",     min = 0,   max = 0.9, fmt = "%.2f" },
+        { key = "scale",   label = "WINDOW SIZE",     min = 0.5, max = 2.2, fmt = "%.2f" },
+    }
+    for i, s in ipairs(sliders) do
+        local ry = dY + 72 + (i-1) * 42
+        F.makeLabel(pg, s.label, UDim2.new(0,8,0,ry), UDim2.new(0,200,0,18), C(160,160,160), Enum.TextXAlignment.Left, 10)
+        local v = F.makeLabel(pg, string.format(s.fmt, Vid[s.key]), UDim2.new(0,306,0,ry), UDim2.new(0,90,0,18),
+            C(255,80,180), Enum.TextXAlignment.Right, 10)
+        F.regText(v)
+        local ck, cf = s.key, s.fmt
+        F.makeSlider(pg, UDim2.new(0,8,0,ry+20), UDim2.new(1,-16,0,12), s.min, s.max, Vid[s.key], function(val)
+            Vid[ck] = val
+            v.Text = string.format(cf, val)
+            if ck == "volume" and Vid.frame then Vid.frame.Volume = val end
+            Vid.applyLayout()
+        end)
+    end
+
+    -- ── video stage ──
+    local sgY = dY + 72 + #sliders * 42 + 4
+    F.makeDivider(pg, sgY, THEMES[currentThemeName].accent)
+    local sgT = F.makeLabel(pg, "VIDEO STAGE", UDim2.new(0,8,0,sgY+6), UDim2.new(1,-16,0,18),
+        C(255,80,180), Enum.TextXAlignment.Left, 11)
+    sgT.Font = Enum.Font.GothamBold
+    F.regText(sgT)
+    local sgBody = F.makeLabel(pg,
+        "Your video replaces the whole world. Only you and your opponent stay, in their normal colours. "
+        .. "Set your opponent in the CAM tab.",
+        UDim2.new(0,8,0,sgY+26), UDim2.new(1,-16,0,28), C(130,130,150), Enum.TextXAlignment.Left, 9)
+    sgBody.TextWrapped = true
+    local sgBtn = F.makeBtn(pg, "VIDEO STAGE OFF", UDim2.new(0,8,0,sgY+58), UDim2.new(1,-16,0,32), C(35,35,55), nil, 11)
+    sgBtn.MouseButton1Click:Connect(function()
+        if Vid.stage.on then Vid.stopStage() else Vid.startStage() end
+    end)
+    local sgInfo = F.makeLabel(pg, "", UDim2.new(0,8,0,sgY+92), UDim2.new(1,-16,0,16),
+        C(160,160,180), Enum.TextXAlignment.Left, 9)
+    Vid.refreshStageUI = function()
+        if not sgBtn.Parent then return end
+        sgBtn.Text = Vid.stage.on and "VIDEO STAGE ON" or "VIDEO STAGE OFF"
+        sgBtn.BackgroundColor3 = Vid.stage.on and C(255,80,180) or C(35,35,55)
+        if not Vid.stage.on then sgInfo.Text = ""; return end
+        -- what the stage is actually drawing right now
+        local function part(e, label, expected)
+            if not expected then return label .. ": not set" end
+            if not e then return label .. ": copy FAILED" end
+            return string.format("%s: %d parts", label, #e.map)
+        end
+        local me, op = Vid.stage.me, Vid.stage.opp
+        sgInfo.Text = part(me, "you", character ~= nil) .. "   |   "
+            .. part(op, "opponent", currentTarget and currentTarget.Character ~= nil)
+        local ok = me and #me.map > 0
+        sgInfo.TextColor3 = ok and C(120,230,150) or C(255,120,90)
+    end
+    Vid.refreshStageUI()
+
+    -- ── converting ──
+    local cvY = sgY + 114
+    F.makeDivider(pg, cvY, THEMES[currentThemeName].accent)
+    local cvT = F.makeLabel(pg, "HAVE AN .MP4?", UDim2.new(0,8,0,cvY+6), UDim2.new(1,-16,0,18),
+        C(255,170,80), Enum.TextXAlignment.Left, 11)
+    cvT.Font = Enum.Font.GothamBold
+    local cvBody = F.makeLabel(pg,
+        "Roblox only plays .webm. Any free video converter works — pick WebM (VP9). "
+        .. "Or with ffmpeg, run this and drop the result in the folder:",
+        UDim2.new(0,8,0,cvY+26), UDim2.new(1,-16,0,30), C(200,200,215), Enum.TextXAlignment.Left, 9)
+    cvBody.TextWrapped = true
+    local cmd = F.makeBox(pg, UDim2.new(0,8,0,cvY+60), UDim2.new(1,-16,0,26), "",
+        "ffmpeg -i input.mp4 -c:v libvpx-vp9 -b:v 2M -c:a libopus output.webm")
+    cmd.TextSize = 9
+    cmd.Font = Enum.Font.Code
+    cmd.ClearTextOnFocus = false
+    cmd.TextEditable = false
+    F.makeLabel(pg, "Short clips at 720p or below load most reliably.",
+        UDim2.new(0,8,0,cvY+90), UDim2.new(1,-16,0,14), C(120,120,140), Enum.TextXAlignment.Left, 9)
+
+    -- ── black screen fade ──
+    local boY = cvY + 116
+    F.makeDivider(pg, boY, C(255,255,255))
+    local boT = F.makeLabel(pg, "BLACK SCREEN FADE", UDim2.new(0,8,0,boY+6), UDim2.new(1,-16,0,18),
+        C(235,235,245), Enum.TextXAlignment.Left, 11)
+    boT.Font = Enum.Font.GothamBold
+    F.makeLabel(pg, "Smoothly fades to black, holds a moment, then slowly fades back in.",
+        UDim2.new(0,8,0,boY+26), UDim2.new(1,-16,0,14), C(130,130,150), Enum.TextXAlignment.Left, 9)
+
+    local boTest = F.makeBtn(pg, "TRY IT", UDim2.new(0,8,0,boY+46), UDim2.new(0,250,0,28), C(20,20,24), nil, 11)
+    boTest.MouseButton1Click:Connect(Vid.blackout)
+    F.makeLabel(pg, "KEY", UDim2.new(0,266,0,boY+46), UDim2.new(0,30,0,28), C(160,160,160), Enum.TextXAlignment.Left, 10)
+    local boKey = F.makeBtn(pg, Vid.boKey, UDim2.new(0,298,0,boY+46), UDim2.new(0,64,0,28), C(25,35,48), nil, 11)
+    boKey.MouseButton1Click:Connect(function()
+        boKey.Text = "..."; boKey.BackgroundColor3 = C(0,200,255)
+        local conn; conn = UserInputService.InputBegan:Connect(function(inp)
+            if inp.KeyCode and inp.KeyCode.Name ~= "Unknown" and not inp.KeyCode.Name:match("Mouse") then
+                Vid.boKey = inp.KeyCode.Name
+                boKey.Text = Vid.boKey
+                boKey.BackgroundColor3 = C(25,35,48)
+                if Keys.refresh then Keys.refresh() end
+                conn:Disconnect()
+            end
+        end)
+    end)
+
+    local boRows = {
+        { key = "boFadeIn",  label = "FADE TO BLACK (s)",  min = 0.05, max = 2, fmt = "%.2f" },
+        { key = "boHold",    label = "STAY BLACK (s)",     min = 0,    max = 3, fmt = "%.2f" },
+        { key = "boFadeOut", label = "FADE BACK IN (s)",   min = 0.2,  max = 6, fmt = "%.2f" },
+    }
+    for i, s in ipairs(boRows) do
+        local ry = boY + 84 + (i-1) * 42
+        F.makeLabel(pg, s.label, UDim2.new(0,8,0,ry), UDim2.new(0,200,0,18), C(160,160,160), Enum.TextXAlignment.Left, 10)
+        local v = F.makeLabel(pg, string.format(s.fmt, Vid[s.key]), UDim2.new(0,306,0,ry), UDim2.new(0,90,0,18),
+            C(255,80,180), Enum.TextXAlignment.Right, 10)
+        F.regText(v)
+        local ck, cf = s.key, s.fmt
+        F.makeSlider(pg, UDim2.new(0,8,0,ry+20), UDim2.new(1,-16,0,12), s.min, s.max, Vid[s.key], function(val)
+            Vid[ck] = val
+            v.Text = string.format(cf, val)
+        end)
+    end
+end
+
+function F.buildTab_Result(pages)
+    local pg = pages["🏆 RESULT"]
+    local C = Color3.fromRGB
+
+    local title = F.makeLabel(pg, "WIN / LOSE", UDim2.new(0,8,0,6), UDim2.new(1,-16,0,22),
+        C(255,80,180), Enum.TextXAlignment.Left, 14)
+    title.Font = Enum.Font.GothamBlack
+    F.regText(title)
+    F.makeLabel(pg, "You decide how the battle ends. Press a button or its key.",
+        UDim2.new(0,8,0,28), UDim2.new(1,-16,0,16), C(130,130,150), Enum.TextXAlignment.Left, 9)
+
+    -- two big buttons
+    local winBtn = F.makeBtn(pg, "WIN", UDim2.new(0,8,0,52), UDim2.new(0.5,-12,0,70), C(210,160,30), C(20,20,25), 22)
+    winBtn.Font = Enum.Font.GothamBlack
+    winBtn.MouseButton1Click:Connect(Result.win)
+    local loseBtn = F.makeBtn(pg, "LOSE", UDim2.new(0.5,4,0,52), UDim2.new(0.5,-12,0,70), C(190,40,50), nil, 22)
+    loseBtn.Font = Enum.Font.GothamBlack
+    loseBtn.MouseButton1Click:Connect(Result.lose)
+
+    -- keybinds under each
+    local function keyBtn(x, field)
+        local b = F.makeBtn(pg, "KEY: " .. Result[field], UDim2.new(x == 0 and 0 or 0.5, x == 0 and 8 or 4, 0, 128),
+            UDim2.new(0.5,-12,0,26), C(25,35,48), nil, 10)
+        b.MouseButton1Click:Connect(function()
+            b.Text = "press a key..."; b.BackgroundColor3 = C(0,200,255)
+            local conn; conn = UserInputService.InputBegan:Connect(function(inp)
+                if inp.KeyCode and inp.KeyCode.Name ~= "Unknown" and not inp.KeyCode.Name:match("Mouse") then
+                    Result[field] = inp.KeyCode.Name
+                    b.Text = "KEY: " .. Result[field]
+                    b.BackgroundColor3 = C(25,35,48)
+                    if Keys.refresh then Keys.refresh() end
+                    conn:Disconnect()
+                end
+            end)
+        end)
+    end
+    keyBtn(0, "winKey")
+    keyBtn(1, "loseKey")
+
+    local bannerBtn = F.makeBtn(pg, "", UDim2.new(0,8,0,162), UDim2.new(1,-16,0,26), C(35,35,55), nil, 10)
+    local function syncBanner()
+        bannerBtn.Text = Result.banner and "YOU WIN / YOU LOSE TEXT: ON" or "YOU WIN / YOU LOSE TEXT: OFF"
+        bannerBtn.BackgroundColor3 = Result.banner and C(60,190,120) or C(35,35,55)
+    end
+    bannerBtn.MouseButton1Click:Connect(function() Result.banner = not Result.banner; syncBanner() end)
+    syncBanner()
+
+    -- ── win ──
+    local wY = 200
+    F.makeDivider(pg, wY, C(255,215,70))
+    local wT = F.makeLabel(pg, "WIN", UDim2.new(0,8,0,wY+6), UDim2.new(1,-16,0,18), C(255,215,70), Enum.TextXAlignment.Left, 11)
+    wT.Font = Enum.Font.GothamBold
+    local cheerBox = F.makeBox(pg, UDim2.new(0,8,0,wY+28), UDim2.new(1,-16,0,28),
+        "cheer animation ID (blank = your avatar's own cheer)", Result.cheerId)
+    cheerBox.FocusLost:Connect(function()
+        Result.cheerId = (cheerBox.Text:gsub("%D",""))
+        cheerBox.Text = Result.cheerId
+    end)
+    local loopBtn = F.makeBtn(pg, "", UDim2.new(0,8,0,wY+62), UDim2.new(0,160,0,26), C(35,35,55), nil, 10)
+    local function syncLoop()
+        loopBtn.Text = Result.cheerLoop and "KEEP CHEERING: ON" or "KEEP CHEERING: OFF"
+        loopBtn.BackgroundColor3 = Result.cheerLoop and C(210,160,30) or C(35,35,55)
+    end
+    loopBtn.MouseButton1Click:Connect(function() Result.cheerLoop = not Result.cheerLoop; syncLoop() end)
+    syncLoop()
+    F.makeLabel(pg, "Loops the cheer for the time below.", UDim2.new(0,176,0,wY+62), UDim2.new(1,-184,0,26),
+        C(120,120,140), Enum.TextXAlignment.Left, 9)
+
+    -- ── lose ──
+    local lY = wY + 142
+    F.makeDivider(pg, lY, C(255,70,70))
+    local lT = F.makeLabel(pg, "LOSE", UDim2.new(0,8,0,lY+6), UDim2.new(1,-16,0,18), C(255,90,90), Enum.TextXAlignment.Left, 11)
+    lT.Font = Enum.Font.GothamBold
+    local sitBox = F.makeBox(pg, UDim2.new(0,8,0,lY+28), UDim2.new(1,-16,0,28),
+        "sitting animation ID (blank = your avatar's own sit)", Result.sitId)
+    sitBox.FocusLost:Connect(function()
+        Result.sitId = (sitBox.Text:gsub("%D",""))
+        sitBox.Text = Result.sitId
+    end)
+
+    F.makeLabel(pg, "FLING DIRECTION", UDim2.new(0,8,0,lY+62), UDim2.new(1,-16,0,16), C(160,160,160), Enum.TextXAlignment.Left, 10)
+    local dirs = { { "AWAY", "Away from opponent" }, { "BACK", "Backwards" }, { "RANDOM", "Random" } }
+    local dirBtns = {}
+    local function syncDirs()
+        for k, b in pairs(dirBtns) do
+            b.BackgroundColor3 = (k == Result.direction) and C(190,40,50) or C(35,35,55)
+        end
+    end
+    for i, d in ipairs(dirs) do
+        local b = F.makeBtn(pg, d[2], UDim2.new(0, 8 + (i-1) * 132, 0, lY + 82), UDim2.new(0,126,0,26), C(35,35,55), nil, 9)
+        dirBtns[d[1]] = b
+        b.MouseButton1Click:Connect(function() Result.direction = d[1]; syncDirs() end)
+    end
+    syncDirs()
+
+    -- speed shows studs/s and mph side by side
+    local rows = {
+        { key = "flingSpeed", label = "FLING SPEED",        min = 10, max = 300, speed = true },
+        { key = "lift",       label = "UPWARD KICK",        min = 0,  max = 150, fmt = "%.0f studs/s" },
+        { key = "spin",       label = "TUMBLE",             min = 0,  max = 40,  fmt = "%.1f" },
+        { key = "getUpAfter", label = "GET UP AFTER",       min = 0.5, max = 8,  fmt = "%.1fs" },
+        { key = "cheerTime",  label = "CHEER LENGTH (WIN)", min = 1,  max = 10,  fmt = "%.1fs" },
+    }
+    local function fmtRow(r, v)
+        if r.speed then return string.format("%.0f studs/s  ≈  %.0f mph", v, Result.mph(v)) end
+        return string.format(r.fmt, v)
+    end
+    for i, r in ipairs(rows) do
+        local ry = lY + 118 + (i-1) * 42
+        F.makeLabel(pg, r.label, UDim2.new(0,8,0,ry), UDim2.new(0,180,0,18), C(160,160,160), Enum.TextXAlignment.Left, 10)
+        local v = F.makeLabel(pg, fmtRow(r, Result[r.key]), UDim2.new(0,186,0,ry), UDim2.new(0,210,0,18),
+            C(255,80,180), Enum.TextXAlignment.Right, 10)
+        F.regText(v)
+        local rr = r
+        F.makeSlider(pg, UDim2.new(0,8,0,ry+20), UDim2.new(1,-16,0,12), r.min, r.max, Result[r.key], function(val)
+            Result[rr.key] = val
+            v.Text = fmtRow(rr, val)
+        end)
+    end
+
+    F.makeLabel(pg, "Your own physics, so other players see the fling. Careful near edges: it can throw you off the map.",
+        UDim2.new(0,8,0,lY + 118 + #rows * 42 + 4), UDim2.new(1,-16,0,28), C(255,170,80), Enum.TextXAlignment.Left, 9).TextWrapped = true
+end
+
 function F.buildTab_Settings(pages)
     local pg6 = pages["⚙ SETTINGS"]
 
@@ -9791,7 +11435,9 @@ function F.buildTab_Settings(pages)
     F.regText(rpTitle)
     F.makeLabel(pg6, "Moves you toward the target on every note press.", UDim2.new(0,8,0,428), UDim2.new(1,-16,0,18), Color3.fromRGB(130,130,150), Enum.TextXAlignment.Left, 10)
 
-    local rpBtn = F.makeBtn(pg6, "📴  RP MODE OFF", UDim2.new(0,8,0,450), UDim2.new(0,160,0,32), Color3.fromRGB(35,35,55), nil, 11)
+    local rpBtn = F.makeBtn(pg6, rpModeEnabled and "⚔  RP MODE ON" or "📴  RP MODE OFF",
+        UDim2.new(0,8,0,450), UDim2.new(0,160,0,32),
+        rpModeEnabled and THEMES[currentThemeName].accent or Color3.fromRGB(35,35,55), nil, 11)
     rpBtn.MouseButton1Click:Connect(function()
         rpModeEnabled = not rpModeEnabled
         if rpModeEnabled then
@@ -9898,6 +11544,10 @@ function F.buildTab_Settings(pages)
         Save.autoSave = not Save.autoSave
         Save.refreshUI()
     end)
+    local svTour = F.makeBtn(pg6, "REPLAY THE TOUR", UDim2.new(0,8,0,svY+272),
+        UDim2.new(0,190,0,26), Color3.fromRGB(255,190,60), Color3.fromRGB(20,20,25), 10)
+    svTour.MouseButton1Click:Connect(function() Intro.startTour() end)
+
     svExport.MouseButton1Click:Connect(function()
         local json = Save.export()
         if json then ioBox.Text = json end
@@ -9912,7 +11562,7 @@ function F.buildTab_Settings(pages)
     -- ============================================================
     -- ── ARROW HUD ──
     -- ============================================================
-    local arY = 1360
+    local arY = svY + 310
     F.makeDivider(pg6, arY, Color3.fromRGB(255,110,230))
     local arTitle = F.makeLabel(pg6, "ARROW HUD", UDim2.new(0,8,0,arY+6),
         UDim2.new(1,-16,0,20), Color3.fromRGB(255,110,230), Enum.TextXAlignment.Left, 12)
@@ -9987,12 +11637,12 @@ function F.buildTab_Settings(pages)
     -- ============================================================
     -- ── HOLD STREAK ──
     -- ============================================================
-    local hnY = 1740
+    local hnY = arY + 380
     F.makeDivider(pg6, hnY, Color3.fromRGB(255,110,230))
     local hnTitle = F.makeLabel(pg6, "HOLD STREAK", UDim2.new(0,8,0,hnY+6),
         UDim2.new(1,-16,0,20), Color3.fromRGB(255,110,230), Enum.TextXAlignment.Left, 12)
     hnTitle.Font = Enum.Font.GothamBold
-    F.makeLabel(pg6, "Hold any note key and a streak grows out of that arrow. Fill it for a burst of health and a score bonus; let go early and you keep part of the score.",
+    F.makeLabel(pg6, "Hold any note key and a streak grows out of that arrow. Health and score trickle in while it fills.",
         UDim2.new(0,8,0,hnY+26), UDim2.new(1,-16,0,40), Color3.fromRGB(130,130,150), Enum.TextXAlignment.Left, 9)
 
     local hnBtn = F.makeBtn(pg6, "HOLD STREAK ON", UDim2.new(0,8,0,hnY+70),
@@ -10032,8 +11682,8 @@ function F.buildTab_Settings(pages)
         while true do
             task.wait(0.5)
             if not hnBest.Parent then break end
-            hnBest.Text = string.format("Score %d   |   Best %d   |   Hold streak %d",
-                math.floor(Notes.score), math.floor(Notes.best), Notes.streak)
+            hnBest.Text = string.format("Score %d   |   Best %d",
+                math.floor(Notes.score), math.floor(Notes.best))
         end
     end)
 
@@ -10045,12 +11695,10 @@ function F.buildTab_Settings(pages)
     Notes.refreshUI()
 
     local hnRows = {
-        { key = "fullTime",       label = "HOLD TIME TO FILL (s)", min = 0.2,  max = 4,    fmt = "%.2f" },
+        { key = "fullTime",       label = "TIME TO FILL (s)",      min = 0.2,  max = 4,    fmt = "%.2f" },
         { key = "startDelay",     label = "TAP IGNORED UNDER (s)", min = 0,    max = 0.4,  fmt = "%.2f" },
         { key = "length",         label = "STREAK LENGTH (px)",    min = 40,   max = 400,  fmt = "%.0f" },
-        { key = "fullHoldHeal",   label = "FULL HOLD HEAL",        min = 0,    max = 0.6,  fmt = "%.2f" },
-        { key = "holdHealPerSec", label = "HEAL WHILE FILLING /s", min = 0,    max = 0.3,  fmt = "%.3f" },
-        { key = "healRate",       label = "BURST SPEED",           min = 0.2,  max = 5,    fmt = "%.2f" },
+        { key = "holdHealPerSec", label = "HEAL WHILE HOLDING /s", min = 0,    max = 0.3,  fmt = "%.3f" },
     }
     for i, row in ipairs(hnRows) do
         local ry = hnY + 166 + (i-1) * 42
@@ -10076,6 +11724,7 @@ function F.buildGUI()
     sg.Name = "FNFInjectorGui"
     sg.ResetOnSpawn = false
     sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.DisplayOrder = F.silZ(100)   -- above the video backdrop and stage layers
     sg.Parent = PlayerGui
 
     notifyContainer = Instance.new("Frame")
@@ -10203,7 +11852,7 @@ function F.buildGUI()
     contentArea.Position = UDim2.new(0,0,0,42+TAB_H+4)
     contentArea.BackgroundTransparency = 1; contentArea.Parent = main
 
-    local tabNames   = { "📋 BINDS", "✂ CUTTER", "🎥 CAM", "🎬 MAKER", "👁 PREVIEW", "❤ FAVES", "🎶 LIST", "🎛 FX", "⚙ SETTINGS" }
+    local tabNames   = { "📋 BINDS", "✂ CUTTER", "🎥 CAM", "🎬 MAKER", "👁 PREVIEW", "❤ FAVES", "🎶 LIST", "🎛 FX", "🎞 VIDEO", "🏆 RESULT", "⚙ SETTINGS" }
     local pages      = {}
     local tabButtons = {}
 
@@ -10258,6 +11907,24 @@ function F.buildGUI()
         end)
     end
 
+    -- lets the tour (and anything else) switch tabs from code
+    F.tabButtons = tabButtons
+    F.selectTab = function(name)
+        if not pages[name] then return end
+        for n, p in pairs(pages) do p.Visible = (n == name) end
+        for n, btn in pairs(tabButtons) do
+            local isActive = (n == name)
+            TweenService:Create(btn, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+                BackgroundTransparency = isActive and 0.1 or 0.65,
+                TextColor3 = isActive and Color3.fromRGB(255,255,255) or Color3.fromRGB(150,150,170),
+            }):Play()
+            local line = btn:FindFirstChild("ActiveLine")
+            if line then
+                TweenService:Create(line, TweenInfo.new(0.18), { BackgroundTransparency = isActive and 0 or 1 }):Play()
+            end
+        end
+    end
+
     F.buildTab_Binds(pages)
     F.buildTab_Cutter(pages)
     F.buildTab_Cam(pages)
@@ -10266,6 +11933,8 @@ function F.buildGUI()
     F.buildTab_Favorites(pages)
     F.buildTab_Playlist(pages)
     F.buildTab_FX(pages)
+    F.buildTab_Video(pages)
+    F.buildTab_Result(pages)
     F.buildTab_Settings(pages)
 
     toggleBtn.MouseButton1Click:Connect(function()
@@ -10296,6 +11965,8 @@ FNFCamera:Start()
 
 -- load settings FIRST so every piece of UI below is built from them
 pcall(Save.boot)
+pcall(Vid.resolveApi)
+pcall(Intro.startLoading)
 
 F.buildArrowHud()
 pcall(function() Chaos.build() end)
