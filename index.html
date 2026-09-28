@@ -375,8 +375,7 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-<script type="text/plain" id="lua-src">--[[
---[[
+<script type="text/plain" id="lua-src">--[[--[[
     ╔══════════════════════════════════════════════════════╗
     ║         FNF ANIMATION INJECTOR v6.2                  ║
     ║  Arrow HUD • Dynamic Face • Anim Maker • Leg Lock    ║
@@ -752,6 +751,22 @@ local Result = {
 
     -- live
     gui = nil, bannerLbl = nil, winTrack = nil, sitTrack = nil, token = 0,
+}
+
+-- ============================================================
+--  MOBILE STATE — FNF-style touch arrows
+-- ============================================================
+local Mobile = {
+    mode      = "AUTO",  -- AUTO (phones/tablets only) / ON / OFF
+    size      = 1,       -- arrow size multiplier
+    spread    = 0.2,     -- gap between the two pairs, as a share of screen width
+    pairGap   = 14,      -- pixels between the two arrows in a pair
+    bottom    = 18,      -- pixels up from the bottom edge
+    idleFade  = 0.15,    -- how see-through an arrow is when you're not touching it
+    hideStrip = false,   -- hide the top arrow strip while the touch arrows are up
+
+    -- live
+    gui = nil, btns = {}, touches = {}, held = {}, active = false,
 }
 
 -- ============================================================
@@ -2991,6 +3006,10 @@ function Save.collect()
                  shakeScale = Ride.shakeScale, windScale = Ride.windScale,
                  leanScale = Ride.leanScale },
 
+        mobile = { mode = Mobile.mode, size = Mobile.size, spread = Mobile.spread,
+                   pairGap = Mobile.pairGap, bottom = Mobile.bottom, idleFade = Mobile.idleFade,
+                   hideStrip = Mobile.hideStrip },
+
         result = { winKey = Result.winKey, loseKey = Result.loseKey, cheerId = Result.cheerId,
                    cheerLoop = Result.cheerLoop, cheerTime = Result.cheerTime, sitId = Result.sitId,
                    flingSpeed = Result.flingSpeed, lift = Result.lift, spin = Result.spin,
@@ -3209,6 +3228,7 @@ function Save.apply(d, silentUi)
     sec("notes",   function() copyInto(Notes, d.notes, { held = true }) end)
     sec("video",   function() copyInto(Vid, d.video) end)
     sec("result",  function() copyInto(Result, d.result) end)
+    sec("mobile",  function() copyInto(Mobile, d.mobile, { active = true }) end)
     sec("spacing", function() copyInto(SPACING, d.spacing) end)
     sec("chaos",   function() copyInto(Chaos, d.chaos, { enabled = true }) end)
     sec("sil",     function() copyInto(SilFX, d.sil) end)
@@ -3398,8 +3418,6 @@ function Save.boot()
 end
 
 function Save.startAuto()
-Notes.start()
-pcall(Intro.finishBoot)
     if Save.autoThread then return end
     Save.autoThread = task.spawn(function()
         while true do
@@ -4999,6 +5017,222 @@ function Result.lose()
             pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
         end
     end)
+end
+
+-- ============================================================
+--  NOTE PRESS / RELEASE
+--  One path for every input: keyboard, touch arrows, anything
+--  later. So every feature behaves the same however you play.
+-- ============================================================
+function F.notePress(row)
+    if cutterEnabled and (F.cutterSliceId(row.dir) or "") ~= "" then
+        F.cutterPlaySlice(row.dir)
+    else
+        if Hold.track then Hold.clear(false) end
+        for _, track in pairs(animTracks) do
+            if track.IsPlaying then track:Stop(0) end
+        end
+        local chosenId = F.rollBindingAnimId(row)
+        F.playAnim(row.key, chosenId, row.speedMult, row.holdLoop)
+    end
+
+    F.hitArrow(row.dir)
+    FNFCamera:RegisterHit("PLAYER")
+    FNFCamera:RegisterDirectionalHit(row.dir)
+    F.fightPlayerHit(row.dir)
+    Ghost.tryPerfect(row.dir)
+    F.swapFace(row.dir)
+    F.triggerRPMovement()
+    if spacing then spacing:OnSingStart(character) end
+    Notes.press(row.dir)
+    F.registerBpmTap()
+    if F.refreshBpmDetectorUI then F.refreshBpmDetectorUI() end
+end
+
+function F.noteRelease(row)
+    if cutterEnabled then
+        F.cutterStopSlice()
+    else
+        F.stopAnim(row.key)
+    end
+    F.releaseArrow(row.dir)
+    F.restoreFace()
+    if spacing then spacing:OnSingStop(character) end
+    Notes.release(row.dir)
+end
+
+function F.rowForDir(dir)
+    for _, row in ipairs(CurrentBindings) do
+        if row.dir == dir then return row end
+    end
+    return nil
+end
+
+-- ============================================================
+--  MOBILE TOUCH ARROWS
+--  FNF's mobile layout: two pairs along the bottom, ← ↓ on the
+--  left and ↑ → on the right, with a gap in the middle for the
+--  stage. Grey when idle, the note's colour when pressed. Every
+--  finger is tracked on its own, so chords and holds work.
+-- ============================================================
+local STRUM_GREY = Color3.fromRGB(135, 163, 173)
+
+function Mobile.shouldShow()
+    if Mobile.mode == "ON" then return true end
+    if Mobile.mode == "OFF" then return false end
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+
+function Mobile.layout()
+    if not Mobile.gui then return end
+    local cam = Workspace.CurrentCamera
+    local vs = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    local W, H = vs.X, vs.Y
+
+    local s = math.clamp(math.min(W * 0.1, H * 0.2), 58, 150) * Mobile.size
+    local step = s + Mobile.pairGap
+    local cx = W / 2
+    local inner = W * Mobile.spread / 2
+    local xs = {
+        LEFT  = cx - inner - step,
+        DOWN  = cx - inner,
+        UP    = cx + inner,
+        RIGHT = cx + inner + step,
+    }
+    for dir, b in pairs(Mobile.btns) do
+        b.frame.Size = UDim2.new(0, s, 0, s)
+        b.frame.Position = UDim2.new(0, xs[dir], 1, -Mobile.bottom - s / 2)
+        b.base = s
+    end
+end
+
+function Mobile.paint(dir, down)
+    local b = Mobile.btns[dir]
+    if not b then return end
+    local s = b.base or 80
+    if down then
+        b.glyph.TextColor3 = ARROW_COLORS[dir].hit
+        b.glyph.TextTransparency = 0
+        b.stroke.Color = Color3.fromRGB(255, 255, 255)
+        b.frame.Size = UDim2.new(0, s * 1.12, 0, s * 1.12)
+        TweenService:Create(b.frame, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Size = UDim2.new(0, s * 0.94, 0, s * 0.94) }):Play()
+    else
+        b.glyph.TextColor3 = STRUM_GREY
+        b.glyph.TextTransparency = Mobile.idleFade
+        b.stroke.Color = Color3.fromRGB(28, 32, 40)
+        TweenService:Create(b.frame, TweenInfo.new(0.14, Enum.EasingStyle.Quad),
+            { Size = UDim2.new(0, s, 0, s) }):Play()
+    end
+end
+
+function Mobile.press(dir)
+    Mobile.held[dir] = (Mobile.held[dir] or 0) + 1
+    if Mobile.held[dir] > 1 then return end        -- a second finger on the same arrow
+    Mobile.paint(dir, true)
+    local row = F.rowForDir(dir)
+    if row then F.notePress(row) end
+end
+
+function Mobile.release(dir)
+    Mobile.held[dir] = math.max(0, (Mobile.held[dir] or 0) - 1)
+    if Mobile.held[dir] > 0 then return end        -- another finger is still on it
+    Mobile.paint(dir, false)
+    local row = F.rowForDir(dir)
+    if row then F.noteRelease(row) end
+end
+
+function Mobile.build()
+    local old = PlayerGui:FindFirstChild("FNFMobileNotes")
+    if old then old:Destroy() end
+    Mobile.btns, Mobile.touches, Mobile.held = {}, {}, {}
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "FNFMobileNotes"
+    sg.IgnoreGuiInset = true
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = F.silZ(90)        -- under the main panel, over the game
+    sg.Parent = PlayerGui
+    Mobile.gui = sg
+
+    for _, dir in ipairs(ARROW_ORDER) do
+        -- the frame is the touch area; it's a little bigger than the arrow
+        local frame = Instance.new("Frame")
+        frame.AnchorPoint = Vector2.new(0.5, 0.5)
+        frame.BackgroundTransparency = 1
+        frame.Active = true
+        frame.Parent = sg
+
+        local glyph = Instance.new("TextLabel")
+        glyph.Size = UDim2.new(1, 0, 1, 0)
+        glyph.BackgroundTransparency = 1
+        glyph.Text = ARROW_SYMBOLS[dir]
+        glyph.TextColor3 = STRUM_GREY
+        glyph.TextTransparency = Mobile.idleFade
+        glyph.Font = Enum.Font.GothamBlack
+        glyph.TextScaled = true
+        glyph.Parent = frame
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 3
+        stroke.Color = Color3.fromRGB(28, 32, 40)
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+        stroke.Parent = glyph
+
+        Mobile.btns[dir] = { frame = frame, glyph = glyph, stroke = stroke }
+
+        frame.InputBegan:Connect(function(input)
+            local t = input.UserInputType
+            if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+            if Mobile.touches[input] then return end
+            Mobile.touches[input] = dir
+            Mobile.press(dir)
+        end)
+    end
+
+    Mobile.layout()
+end
+
+-- A finger lifting anywhere counts, even if it slid off the arrow first,
+-- so a note can never get stuck held down.
+local function mobileEnded(input)
+    local dir = Mobile.touches[input]
+    if dir then
+        Mobile.touches[input] = nil
+        Mobile.release(dir)
+    end
+end
+UserInputService.InputEnded:Connect(mobileEnded)
+UserInputService.TouchEnded:Connect(function(touch) mobileEnded(touch) end)
+
+function Mobile.refresh()
+    local show = Mobile.shouldShow()
+    Mobile.active = show
+    if show then
+        if not Mobile.gui or not Mobile.gui.Parent then Mobile.build() end
+        Mobile.gui.Enabled = true
+        Mobile.layout()
+    elseif Mobile.gui then
+        -- let go of anything still held before hiding
+        for dir, n in pairs(Mobile.held) do
+            if n > 0 then Mobile.held[dir] = 1; Mobile.release(dir) end
+        end
+        Mobile.touches = {}
+        Mobile.gui.Enabled = false
+    end
+    if Arrows.container then
+        Arrows.container.Visible = not (show and Mobile.hideStrip)
+    end
+    if Mobile.refreshUI then Mobile.refreshUI() end
+end
+
+function Mobile.start()
+    Mobile.refresh()
+    local cam = Workspace.CurrentCamera
+    if cam then
+        cam:GetPropertyChangedSignal("ViewportSize"):Connect(Mobile.layout)
+    end
+    -- plugging in a keyboard (or unplugging it) re-checks AUTO
+    UserInputService:GetPropertyChangedSignal("KeyboardEnabled"):Connect(Mobile.refresh)
 end
 
 -- ============================================================
@@ -6811,40 +7045,9 @@ function F.onInput(input, gameProcessed)
     for _, row in ipairs(CurrentBindings) do
         if input.KeyCode and input.KeyCode.Name == row.key then
             if input.UserInputState == Enum.UserInputState.Begin then
-
-                if cutterEnabled and (F.cutterSliceId(row.dir) or "") ~= "" then
-                    F.cutterPlaySlice(row.dir)
-                else
-                    if Hold.track then Hold.clear(false) end
-                    for k, track in pairs(animTracks) do
-                        if track.IsPlaying then track:Stop(0) end
-                    end
-                    local chosenId = F.rollBindingAnimId(row)
-                    F.playAnim(row.key, chosenId, row.speedMult, row.holdLoop)
-                end
-
-                F.hitArrow(row.dir)
-                FNFCamera:RegisterHit("PLAYER")
-                FNFCamera:RegisterDirectionalHit(row.dir)
-                F.fightPlayerHit(row.dir)
-                Ghost.tryPerfect(row.dir)
-                F.swapFace(row.dir)
-                F.triggerRPMovement()
-                if spacing then spacing:OnSingStart(character) end
-                Notes.press(row.dir)
-                F.registerBpmTap()
-                if F.refreshBpmDetectorUI then F.refreshBpmDetectorUI() end
-
+                F.notePress(row)
             elseif input.UserInputState == Enum.UserInputState.End then
-                if cutterEnabled then
-                    F.cutterStopSlice()
-                else
-                    F.stopAnim(row.key)
-                end
-                F.releaseArrow(row.dir)
-                F.restoreFace()
-                if spacing then spacing:OnSingStop(character) end
-                Notes.release(row.dir)
+                F.noteRelease(row)
             end
         end
     end
@@ -7256,6 +7459,7 @@ function F.buildArrowHud()
     holder.ZIndex = F.silZ(62)
     holder.Parent = sg
     Arrows.container = holder
+    if Mobile.active and Mobile.hideStrip then holder.Visible = false end
 
     -- notes render behind the arrows
     local noteLayer = Instance.new("Frame")
@@ -11715,6 +11919,78 @@ function F.buildTab_Settings(pages)
                 vlbl.Text = string.format(cfm, v)
             end)
     end
+    -- ============================================================
+    -- ── MOBILE ──
+    -- ============================================================
+    local mbY = hnY + 340
+    F.makeDivider(pg6, mbY, Color3.fromRGB(120,220,255))
+    local mbTitle = F.makeLabel(pg6, "MOBILE ARROWS", UDim2.new(0,8,0,mbY+6),
+        UDim2.new(1,-16,0,20), Color3.fromRGB(120,220,255), Enum.TextXAlignment.Left, 12)
+    mbTitle.Font = Enum.Font.GothamBold
+    F.makeLabel(pg6, "Big touch arrows along the bottom, split into two pairs like FNF on mobile. Tap or hold them exactly like your note keys.",
+        UDim2.new(0,8,0,mbY+26), UDim2.new(1,-16,0,28), Color3.fromRGB(130,130,150), Enum.TextXAlignment.Left, 9).TextWrapped = true
+
+    local mbMode = F.makeBtn(pg6, "", UDim2.new(0,8,0,mbY+58), UDim2.new(0,190,0,28), Color3.fromRGB(35,35,55), nil, 10)
+    local mbNote = F.makeLabel(pg6, "", UDim2.new(0,206,0,mbY+58), UDim2.new(1,-214,0,28),
+        Color3.fromRGB(120,120,140), Enum.TextXAlignment.Left, 9)
+    mbNote.TextWrapped = true
+    local modeHelp = {
+        AUTO = "Shows on phones and tablets, hides with a keyboard.",
+        ON   = "Always shown, even on PC (handy for testing).",
+        OFF  = "Never shown.",
+    }
+    mbMode.MouseButton1Click:Connect(function()
+        local order = { "AUTO", "ON", "OFF" }
+        Mobile.mode = order[((table.find(order, Mobile.mode) or 1) % #order) + 1]
+        Mobile.refresh()
+    end)
+
+    local mbStrip = F.makeBtn(pg6, "", UDim2.new(0,8,0,mbY+92), UDim2.new(0,190,0,26), Color3.fromRGB(35,35,55), nil, 9)
+    mbStrip.MouseButton1Click:Connect(function()
+        Mobile.hideStrip = not Mobile.hideStrip
+        Mobile.refresh()
+    end)
+    F.makeLabel(pg6, "Hold streaks and splashes live on the top strip.",
+        UDim2.new(0,206,0,mbY+92), UDim2.new(1,-214,0,26), Color3.fromRGB(120,120,140), Enum.TextXAlignment.Left, 9)
+
+    Mobile.refreshUI = function()
+        if not mbMode.Parent then return end
+        mbMode.Text = "MOBILE ARROWS: " .. Mobile.mode
+        mbMode.BackgroundColor3 = (Mobile.mode == "OFF") and Color3.fromRGB(35,35,55) or Color3.fromRGB(60,160,220)
+        mbNote.Text = (modeHelp[Mobile.mode] or "") .. (Mobile.active and "  (showing)" or "")
+        mbStrip.Text = Mobile.hideStrip and "HIDE TOP STRIP: ON" or "HIDE TOP STRIP: OFF"
+        mbStrip.BackgroundColor3 = Mobile.hideStrip and Color3.fromRGB(60,160,220) or Color3.fromRGB(35,35,55)
+    end
+    Mobile.refreshUI()
+
+    local mbRows = {
+        { key = "size",     label = "ARROW SIZE",           min = 0.5, max = 1.8, fmt = "%.2f" },
+        { key = "spread",   label = "GAP BETWEEN PAIRS",    min = 0,   max = 0.6, fmt = "%.2f" },
+        { key = "pairGap",  label = "GAP INSIDE A PAIR",    min = 0,   max = 80,  fmt = "%.0f px" },
+        { key = "bottom",   label = "HEIGHT FROM BOTTOM",   min = 0,   max = 260, fmt = "%.0f px" },
+        { key = "idleFade", label = "SEE-THROUGH WHEN IDLE", min = 0,  max = 0.8, fmt = "%.2f" },
+    }
+    for i, row in ipairs(mbRows) do
+        local ry = mbY + 128 + (i-1) * 42
+        F.makeLabel(pg6, row.label, UDim2.new(0,8,0,ry), UDim2.new(0,230,0,18),
+            Color3.fromRGB(160,160,160), Enum.TextXAlignment.Left, 10)
+        local vlbl = F.makeLabel(pg6, string.format(row.fmt, Mobile[row.key]),
+            UDim2.new(0,306,0,ry), UDim2.new(0,90,0,18), Color3.fromRGB(255,80,180), Enum.TextXAlignment.Right, 10)
+        F.regText(vlbl)
+        local ck, cfm = row.key, row.fmt
+        F.makeSlider(pg6, UDim2.new(0,8,0,ry+20), UDim2.new(1,-16,0,12),
+            row.min, row.max, Mobile[row.key], function(v)
+                Mobile[ck] = v
+                vlbl.Text = string.format(cfm, v)
+                Mobile.layout()
+                if ck == "idleFade" then
+                    for d in pairs(Mobile.btns) do
+                        if (Mobile.held[d] or 0) == 0 then Mobile.paint(d, false) end
+                    end
+                end
+            end)
+    end
+
 end
 
 function F.buildGUI()
@@ -11979,6 +12255,9 @@ F.buildGUI()
 pcall(function() F.setTheme(currentThemeName) end)
 
 Save.startAuto()
+Notes.start()
+pcall(Mobile.start)
+pcall(Intro.finishBoot)
 
 if LocalPlayer.Character then task.spawn(F.setupCharacter, LocalPlayer.Character) end
 LocalPlayer.CharacterAdded:Connect(function(c) task.spawn(F.setupCharacter, c) end)
