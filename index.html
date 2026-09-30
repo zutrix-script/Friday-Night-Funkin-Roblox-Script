@@ -375,7 +375,7 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-<script type="text/plain" id="lua-src">--[[--[[
+<script type="text/plain" id="lua-src">--[[
     ╔══════════════════════════════════════════════════════╗
     ║         FNF ANIMATION INJECTOR v6.2                  ║
     ║  Arrow HUD • Dynamic Face • Anim Maker • Leg Lock    ║
@@ -566,6 +566,26 @@ local Ride = {
     lastPos = nil, lastVel = Vector3.new(0, 0, 0), lateralG = 0,
     speed = 0, smooth = 0,
     wasAnchored = false, walkTrack = nil, jumpConn = nil,
+    stepConn = nil,                                  -- runs just before physics
+    platVel = Vector3.new(0, 0, 0),                  -- what the object is doing, world space
+    walkVel = Vector3.new(0, 0, 0),                  -- your own walking, world space
+    savedAutoRotate = nil, savedStates = nil,
+
+    -- ping compensation: other players see you one round trip behind the object
+    pingComp   = true,   -- send your position ahead of the object by your ping
+    pingScale  = 1,      -- 1 = exactly your ping; tune up or down to taste
+    maxLead    = 0.6,    -- never lead by more than this many seconds
+    pingMs     = 0, leadStuds = 0, lastPingT = 0,
+    pingSource = "MINE",     -- MINE is the right number; AVERAGE kept as an option
+    extraMs    = 50,         -- your screen shows other objects slightly late; this covers that
+    pingCount  = 1, pingOthers = false, warnedOthers = false,
+    leadTime   = 0,                        -- seconds ahead the replicated pose is predicted
+    lastCF     = nil,                      -- the object's pose last frame
+    platAng    = Vector3.new(0, 0, 0),     -- the object's spin, world space (rad/s)
+    turnDeg    = 0,                        -- spin in degrees/s, for the readout
+
+    -- our own animations while locked (the default falling one would win otherwise)
+    tracks = nil, currentAnim = nil,
     bindName = "FNFRideLock",
     gui = nil, streaks = {}, readout = nil,
 }
@@ -2918,7 +2938,7 @@ function Save.collect()
 
     return {
         version = INJECTOR_VERSION,
-        defaultsVersion = 2,
+        defaultsVersion = 3,
         tourSeen = Intro.seen,
         binds = binds,
         sections = secs,
@@ -2998,7 +3018,9 @@ function Save.collect()
             splash = Arrows.splash, combo = Arrows.combo, tilt = Arrows.tilt,
         },
 
-        ride = { key = Ride.key, walkWith = Ride.walkWith, jumpWith = Ride.jumpWith,
+        ride = { key = Ride.key, pingComp = Ride.pingComp, pingScale = Ride.pingScale,
+                 pingSource = Ride.pingSource, extraMs = Ride.extraMs,
+                 walkWith = Ride.walkWith, jumpWith = Ride.jumpWith,
                  clampEdges = Ride.clampEdges, edgeMargin = Ride.edgeMargin,
                  gravityScale = Ride.gravityScale, pickRadius = Ride.pickRadius,
                  shake = Ride.shake, wind = Ride.wind, speedFov = Ride.speedFov,
@@ -3286,6 +3308,13 @@ function Save.apply(d, silentUi)
     -- anyone with a save file from before the tour existed isn't new
     if d.tourSeen == true or d.tourSeen == nil then Intro.seen = true end
 
+    -- ride lead: AVERAGE turned out to be the wrong number; saves from before
+    -- defaults v3 move to MINE (plus the new screen-delay allowance) once
+    if (tonumber(d.defaultsVersion) or 1) < 3 then
+        Ride.pingSource = "MINE"
+        if (Ride.extraMs or 0) < 50 then Ride.extraMs = 50 end
+    end
+
     -- saves from before defaults v2 had these switched on without you asking
     if (tonumber(d.defaultsVersion) or 1) < 2 then
         FNFCamera.snapHits = false
@@ -3521,22 +3550,154 @@ function Ride.jumpVelocity(hum)
     return math.sqrt(2 * g * ((okH and h) or 7.2))
 end
 
--- Borrow the character's own walk animation so walking on the object
--- still looks like walking (an anchored root reads as standing still).
-function Ride.loadWalk(hum)
-    if Ride.walkTrack then return end
-    local animate = character and character:FindFirstChild("Animate")
-    local walkVal = animate and animate:FindFirstChild("walk")
-    local anim = walkVal and walkVal:FindFirstChildOfClass("Animation")
-    if not anim then return end
-    local animr = hum:FindFirstChildOfClass("Animator")
-    if not animr then return end
-    local ok, t = pcall(function() return animr:LoadAnimation(anim) end)
-    if ok and t then
-        t.Priority = Enum.AnimationPriority.Movement
-        t.Looped = true
-        Ride.walkTrack = t
+-- Borrow the character's own idle, walk, jump and fall animations from its
+-- Animate script and play them ourselves, at a priority above the default
+-- ones. While you're locked on, the object is moving under you, so the
+-- humanoid can decide you're falling and play its falling animation. Ours
+-- outrank that, so you look planted on the object instead.
+function Ride.stopAnims(fade)
+    for _, t in pairs(Ride.tracks or {}) do
+        pcall(function() if t.IsPlaying then t:Stop(fade or 0.15) end end)
     end
+    Ride.currentAnim = nil
+end
+
+function Ride.loadAnims(hum)
+    Ride.stopAnims(0)
+    Ride.tracks, Ride.currentAnim = {}, nil
+    local animate = character and character:FindFirstChild("Animate")
+    local animr = hum and hum:FindFirstChildOfClass("Animator")
+    if not animate or not animr then return end
+
+    local function load(folderName, preferred)
+        local folder = animate:FindFirstChild(folderName)
+        if not folder then return nil end
+        local anim = folder:FindFirstChild(preferred)
+        if not (anim and anim:IsA("Animation")) then anim = folder:FindFirstChildOfClass("Animation") end
+        if not anim then return nil end
+        local ok, t = pcall(function() return animr:LoadAnimation(anim) end)
+        if not ok or not t then return nil end
+        t.Priority = Enum.AnimationPriority.Movement
+        t.Looped = (folderName ~= "jump")
+        return t
+    end
+    Ride.tracks = {
+        idle = load("idle", "Animation1"),
+        walk = load("walk", "WalkAnim"),
+        jump = load("jump", "JumpAnim"),
+        fall = load("fall", "FallAnim"),
+    }
+end
+
+-- Idle when standing on it, walk when moving, jump then fall in the air.
+function Ride.updateAnim(hum, moving)
+    local tracks = Ride.tracks
+    if not tracks then return end
+    local want = "idle"
+    if not Ride.grounded then want = (Ride.vy > 0) and "jump" or "fall"
+    elseif moving then want = "walk" end
+    if not tracks[want] then want = "idle" end
+    local t = tracks[want]
+    if not t then return end
+
+    if Ride.currentAnim ~= want then
+        local old = tracks[Ride.currentAnim]
+        if old and old ~= t and old.IsPlaying then old:Stop(0.12) end
+        Ride.currentAnim = want
+    end
+    if not t.IsPlaying then t:Play(0.12) end
+    if want == "walk" then t:AdjustSpeed(math.max(hum.WalkSpeed / 16, 0.1)) end
+end
+
+-- Ping in milliseconds. MINE reads yours from the network stats Roblox shows
+-- on its own performance overlay. AVERAGE also tries to read every other
+-- player's ping and averages them all. If other players' pings can't be read
+-- here it quietly falls back to yours and reports that, so you always know
+-- which one you're getting.
+-- Returns: ms, how many players went into it, whether any other player's ping was readable.
+function Ride.measurePing()
+    local mine
+    local ok, v = pcall(function()
+        return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and type(v) == "number" and v > 0 then mine = v end
+    if not mine then
+        local ok2, p = pcall(function() return LocalPlayer:GetNetworkPing() end)   -- seconds
+        if ok2 and type(p) == "number" and p > 0 then mine = p * 1000 end
+    end
+    if Ride.pingSource ~= "AVERAGE" then return mine, 1, false end
+
+    local sum, n, others = 0, 0, 0
+    if mine then sum, n = mine, 1 end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local okp, p = pcall(function() return plr:GetNetworkPing() end)      -- seconds
+            if okp and type(p) == "number" and p > 0 and p < 5 then
+                sum = sum + p * 1000
+                n = n + 1
+                others = others + 1
+            end
+        end
+    end
+    if n == 0 then return nil, 0, false end
+    return sum / n, n, others > 0
+end
+
+-- If YOU are simulating the object (you're driving it), your screen and
+-- everyone else's agree on where it is, so there's nothing to compensate for.
+function Ride.locallyOwned(part)
+    if part.Anchored then return false end
+    local ok, age = pcall(function() return part.ReceiveAge end)
+    return ok and age == 0
+end
+
+-- Writes your position AND velocity from the object-space state.
+--
+-- The root is NOT anchored. An anchored part moved by a client script never
+-- replicates, so other players saw you frozen where you locked on while the
+-- object drove away. Unanchored, you keep network ownership and this position
+-- is what gets sent to everyone. Velocity is written too, so other players
+-- interpolate you smoothly instead of seeing you jump between updates.
+--
+-- Runs twice a frame: once just before physics (Stepped), so physics starts
+-- from the right place, and once just before the camera, so it never sees a
+-- stale frame. It only writes state, so running twice does no harm.
+function Ride.apply(forReplication)
+    if not Ride.enabled then return end
+    local part = Ride.part
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not part or not part.Parent or not root then return end
+    local pcf = part.CFrame
+
+    -- Other players see you about one round trip (plus your screen's own
+    -- delay on the object) behind where the object is. So the pose sent out
+    -- -- the write right before physics -- is where the object WILL be by
+    -- the time it arrives: its position AND rotation, extrapolated with its
+    -- speed and spin. Rotation matters: leading in a straight line alone is
+    -- what threw you off the side on every turn.
+    -- The write right before the camera uses the object as it is now, so on
+    -- your own screen you stay glued to it.
+    local base = pcf
+    if forReplication and Ride.leadTime > 0 then
+        local t = Ride.leadTime
+        local rot = pcf.Rotation
+        local w = Ride.platAng
+        local a = w.Magnitude * t
+        if a > 1e-5 then rot = CFrame.fromAxisAngle(w.Unit, a) * rot end
+        base = CFrame.new(pcf.Position + Ride.platVel * t) * rot
+    end
+
+    local cf = base
+        * CFrame.new(Ride.localPos + Vector3.new(0, Ride.yOff, 0))
+        * CFrame.Angles(0, Ride.yaw, 0)
+    root.CFrame = cf
+
+    -- Velocity of the exact spot you're standing on (spin included), so the
+    -- smoothing on other screens carries you around a turn between updates
+    -- instead of sliding you off in a straight line.
+    local r = cf.Position - base.Position
+    root.AssemblyLinearVelocity = Ride.platVel + Ride.platAng:Cross(r) + Ride.walkVel + base.UpVector * Ride.vy
+    root.AssemblyAngularVelocity = Ride.platAng
 end
 
 function Ride.step(dt)
@@ -3553,6 +3714,7 @@ function Ride.step(dt)
 
     -- ---- walking, done in the object's own space ----
     local moving = false
+    Ride.walkVel = Vector3.new(0, 0, 0)
     local md = hum.MoveDirection
     if Ride.walkWith and md.Magnitude > 0.05 then
         local lm = pcf:VectorToObjectSpace(md)
@@ -3561,6 +3723,7 @@ function Ride.step(dt)
             local speed = hum.WalkSpeed * math.min(md.Magnitude, 1)
             Ride.localPos = Ride.localPos + lm.Unit * speed * dt
             Ride.yaw = math.atan2(-lm.X, -lm.Z)
+            Ride.walkVel = pcf:VectorToWorldSpace(lm.Unit * speed)
             moving = true
         end
     end
@@ -3585,24 +3748,53 @@ function Ride.step(dt)
             math.clamp(Ride.localPos.Z, -mz, mz))
     end
 
-    -- ---- rebuild the world position from scratch ----
-    root.CFrame = pcf
-        * CFrame.new(Ride.localPos + Vector3.new(0, Ride.yOff, 0))
-        * CFrame.Angles(0, Ride.yaw, 0)
+    -- (position is written by Ride.apply() below, once the object's speed is known)
 
-    -- ---- walk animation ----
-    if Ride.walkTrack then
-        local want = moving and Ride.grounded
-        if want and not Ride.walkTrack.IsPlaying then Ride.walkTrack:Play(0.15)
-        elseif not want and Ride.walkTrack.IsPlaying then Ride.walkTrack:Stop(0.2) end
-        if want then Ride.walkTrack:AdjustSpeed(hum.WalkSpeed / 16) end
-    end
+    -- ---- animation: idle on it, walk when moving, jump / fall in the air ----
+    Ride.updateAnim(hum, moving)
 
     -- ---- object speed, for the effects ----
-    local vel = Vector3.new(0, 0, 0)
-    if Ride.lastPos then vel = (pcf.Position - Ride.lastPos) / dt end
+    local vel, ang = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+    if Ride.lastCF then
+        vel = (pcf.Position - Ride.lastCF.Position) / dt
+        local okA, axis, angle = pcall(function()
+            return (pcf.Rotation * Ride.lastCF.Rotation:Inverse()):ToAxisAngle()
+        end)
+        if okA and angle == angle and math.abs(angle) > 1e-6 then ang = axis * (angle / dt) end
+    end
+    Ride.lastCF = pcf
     Ride.lastPos = pcf.Position
-    if vel.Magnitude > 2000 then vel = Vector3.new(0, 0, 0) end   -- teleport, ignore
+    if vel.Magnitude > 2000 or ang.Magnitude > 60 then          -- a teleport, not motion
+        vel, ang = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+    end
+
+    -- smoothed, so noisy per-frame speed doesn't shake what gets replicated
+    Ride.platVel = Ride.platVel:Lerp(vel, 1 - math.exp(-14 * dt))
+    Ride.platAng = Ride.platAng:Lerp(ang, 1 - math.exp(-14 * dt))
+    Ride.turnDeg = math.deg(Ride.platAng.Magnitude)
+
+    -- ping compensation: sample a few times a second, smooth it, then lead
+    local clk = os.clock()
+    if clk - Ride.lastPingT > 0.25 then
+        Ride.lastPingT = clk
+        local ms, cnt, others = Ride.measurePing()
+        if ms then
+            Ride.pingMs = (Ride.pingMs <= 0) and ms or (Ride.pingMs * 0.7 + ms * 0.3)
+            Ride.pingCount, Ride.pingOthers = cnt, others
+        end
+        if Ride.pingSource == "AVERAGE" and not others and not Ride.warnedOthers
+            and #Players:GetPlayers() > 1 then
+            Ride.warnedOthers = true
+            F.notify("Can't read other players' pings in this game — using yours only", "warn")
+        end
+    end
+    local lead = 0
+    if Ride.pingComp and not Ride.locallyOwned(part) then
+        lead = math.min((Ride.pingMs + Ride.extraMs) / 1000 * Ride.pingScale, Ride.maxLead)
+    end
+    Ride.leadTime = lead
+    Ride.leadStuds = (Ride.platVel * lead).Magnitude
+    Ride.apply(false)
 
     local accel = (vel - Ride.lastVel) / dt
     Ride.lastVel = vel
@@ -3664,10 +3856,27 @@ function Ride.lock()
     Ride.lastPos, Ride.lastVel = part.Position, Vector3.new(0, 0, 0)
     Ride.speed, Ride.smooth, Ride.lateralG = 0, 0, 0
 
-    -- anchored root: physics can't pull us off, however fast it goes
+    -- Never anchor: it would stop your position replicating (other players
+    -- would see you floating where you locked on). Instead we rewrite position
+    -- and velocity every frame before physics, and stop the humanoid from
+    -- turning you or tripping over at speed.
     Ride.wasAnchored = root.Anchored
-    root.Anchored = true
-    Ride.loadWalk(hum)
+    root.Anchored = false
+    Ride.savedAutoRotate = hum.AutoRotate
+    hum.AutoRotate = false
+    Ride.savedStates = {}
+    for _, st in ipairs({ Enum.HumanoidStateType.FallingDown, Enum.HumanoidStateType.Ragdoll,
+                          Enum.HumanoidStateType.Freefall }) do
+        local ok, on = pcall(function() return hum:GetStateEnabled(st) end)
+        Ride.savedStates[st] = (not ok) or on
+        pcall(function() hum:SetStateEnabled(st, false) end)
+    end
+    Ride.platVel, Ride.walkVel = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)   -- drop any falling pose
+    Ride.leadTime, Ride.lastCF = 0, part.CFrame
+    Ride.platAng, Ride.turnDeg = Vector3.new(0, 0, 0), 0
+    Ride.warnedOthers, Ride.lastPingT = false, 0
+    Ride.loadAnims(hum)
 
     if Ride.jumpConn then Ride.jumpConn:Disconnect() end
     Ride.jumpConn = UserInputService.JumpRequest:Connect(function()
@@ -3685,6 +3894,9 @@ function Ride.lock()
     pcall(function() RunService:UnbindFromRenderStep(Ride.bindName) end)
     RunService:BindToRenderStep(Ride.bindName, Enum.RenderPriority.Camera.Value - 1,
         function(dt) Ride.step(dt) end)
+    -- and again right before physics, which is what actually gets replicated
+    if Ride.stepConn then Ride.stepConn:Disconnect() end
+    Ride.stepConn = RunService.Stepped:Connect(function() Ride.apply(true) end)
 
     Ride.enabled = true
     if Ride.refreshUI then Ride.refreshUI() end
@@ -3697,6 +3909,7 @@ function Ride.unlock(reason)
     Ride.enabled = false
     pcall(function() RunService:UnbindFromRenderStep(Ride.bindName) end)
     if Ride.jumpConn then Ride.jumpConn:Disconnect(); Ride.jumpConn = nil end
+    if Ride.stepConn then Ride.stepConn:Disconnect(); Ride.stepConn = nil end
 
     local root = character and character:FindFirstChild("HumanoidRootPart")
     if root then
@@ -3706,8 +3919,20 @@ function Ride.unlock(reason)
             pcall(function() root.AssemblyLinearVelocity = Ride.lastVel end)
         end
     end
-    if Ride.walkTrack then pcall(function() Ride.walkTrack:Stop(0.2) end) end
-    Ride.walkTrack = nil
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        if Ride.savedAutoRotate ~= nil then hum.AutoRotate = Ride.savedAutoRotate end
+        for st, on in pairs(Ride.savedStates or {}) do
+            pcall(function() hum:SetStateEnabled(st, on) end)
+        end
+    end
+    Ride.savedAutoRotate, Ride.savedStates = nil, nil
+    Ride.platVel, Ride.walkVel = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+
+    Ride.stopAnims(0.2)
+    Ride.tracks = nil
+    Ride.leadTime, Ride.leadStuds, Ride.lastCF = 0, 0, nil
+    Ride.platAng, Ride.turnDeg = Vector3.new(0, 0, 0), 0
 
     if Ride.gui then Ride.gui.Enabled = false end
     FNFCamera.rideShake, FNFCamera.rideFov, FNFCamera.rideLean = 0, 0, 0
@@ -10476,15 +10701,25 @@ function F.buildTab_Cam(pages)
     Ride.refreshUI()
 
     local rdStatus = F.makeLabel(pgCam, "", UDim2.new(0,8,0,rdY+106),
-        UDim2.new(1,-16,0,18), Color3.fromRGB(160,160,180), Enum.TextXAlignment.Left, 9)
+        UDim2.new(1,-16,0,24), Color3.fromRGB(160,160,180), Enum.TextXAlignment.Left, 9)
+    rdStatus.TextWrapped = true
+    rdStatus.TextYAlignment = Enum.TextYAlignment.Top
     task.spawn(function()
         while true do
             task.wait(0.25)
             if not rdStatus.Parent then break end
             if Ride.enabled and Ride.part then
-                rdStatus.Text = string.format("locked to %s  |  %.0f studs/s  |  %s",
-                    Ride.part.Name:sub(1, 20), Ride.smooth,
-                    Ride.grounded and "on it" or "jumping")
+                local pingTxt
+                if Ride.pingSource == "AVERAGE" and Ride.pingOthers then
+                    pingTxt = string.format("average ping %d ms (%d players)",
+                        math.floor(Ride.pingMs + 0.5), Ride.pingCount)
+                else
+                    pingTxt = string.format("ping %d ms (yours only)", math.floor(Ride.pingMs + 0.5))
+                end
+                rdStatus.Text = string.format("locked to %s  |  %.0f studs/s, turning %.0f°/s  |  %s\n%s  |  sending you %d ms ahead (%.1f studs)",
+                    Ride.part.Name:sub(1, 14), Ride.smooth, Ride.turnDeg,
+                    Ride.grounded and "on it" or "jumping", pingTxt,
+                    math.floor(Ride.leadTime * 1000 + 0.5), Ride.leadStuds)
                 rdStatus.TextColor3 = Color3.fromRGB(120,220,255)
             else
                 rdStatus.Text = "not locked"
@@ -10501,6 +10736,7 @@ function F.buildTab_Cam(pages)
         { key = "wind",       on = "WIND: ON",        off = "WIND: OFF" },
         { key = "speedFov",   on = "SPEED FOV: ON",   off = "SPEED FOV: OFF" },
         { key = "gLean",      on = "G-LEAN: ON",      off = "G-LEAN: OFF" },
+        { key = "pingComp",   on = "PING LEAD: ON",   off = "PING LEAD: OFF" },
     }
     for i, t in ipairs(rdToggles) do
         local col = (i - 1) % 3
@@ -10517,6 +10753,17 @@ function F.buildTab_Cam(pages)
         end)
     end
 
+    local rdPingSrc = F.makeBtn(pgCam, "PING: " .. Ride.pingSource,
+        UDim2.new(0, 8 + 2 * 132, 0, rdY + 130 + 2 * 32), UDim2.new(0,126,0,26),
+        Color3.fromRGB(70,120,255), nil, 9)
+    rdPingSrc.MouseButton1Click:Connect(function()
+        Ride.pingSource = (Ride.pingSource == "AVERAGE") and "MINE" or "AVERAGE"
+        rdPingSrc.Text = "PING: " .. Ride.pingSource
+        Ride.warnedOthers, Ride.lastPingT, Ride.pingMs = false, 0, 0   -- start fresh with the new source
+        F.notify(Ride.pingSource == "AVERAGE" and "Using everyone's average ping (your own is usually more accurate)"
+            or "Using your ping — the number that decides the gap", "info")
+    end)
+
     local rdRows = {
         { key = "edgeMargin",   label = "EDGE MARGIN",              min = 0,   max = 5,   fmt = "%.1f" },
         { key = "gravityScale", label = "JUMP GRAVITY",             min = 0.2, max = 3,   fmt = "%.2f" },
@@ -10526,6 +10773,8 @@ function F.buildTab_Cam(pages)
         { key = "shakeScale",   label = "SHAKE AMOUNT",             min = 0,   max = 3,   fmt = "%.2f" },
         { key = "windScale",    label = "WIND AMOUNT",              min = 0,   max = 2,   fmt = "%.2f" },
         { key = "leanScale",    label = "G-LEAN AMOUNT",            min = 0,   max = 3,   fmt = "%.2f" },
+        { key = "pingScale",    label = "PING LEAD STRENGTH",       min = 0,   max = 2,   fmt = "%.2f" },
+        { key = "extraMs",      label = "EXTRA LEAD (ms)",          min = 0,   max = 300, fmt = "%.0f" },
     }
     for i, row in ipairs(rdRows) do
         local ry = rdY + 130 + math.ceil(#rdToggles / 3) * 32 + 6 + (i-1) * 42
@@ -12266,7 +12515,7 @@ task.spawn(F.setupMusicRemote)
 task.spawn(F.setupMatchRemote)
 F.broadcastScriptPresence()
 
-print("[FNF] Injector v6.2 fully loaded, boss man.")
+print("[FNF] Injector v7.0 fully loaded")
 </script>
 
 <script>
