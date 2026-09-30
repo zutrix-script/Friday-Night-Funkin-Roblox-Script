@@ -375,7 +375,132 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-<script type="text/plain" id="lua-src"> 
+<script type="text/plain" id="lua-src"> --[[
+    ╔══════════════════════════════════════════════════════╗
+    ║         FNF ANIMATION INJECTOR v6.2                  ║
+    ║  Arrow HUD • Dynamic Face • Anim Maker • Leg Lock    ║
+    ║  + Idle BPM Speed Control                             ║
+    ║  + Live Preview • Favorites • Playlist • Themes       ║
+    ║  + Hold-to-Loop + Weighted Alt Animations (per bind)  ║
+    ║  + Dynamic Spacing System (search/toggle/presets)     ║
+    ║  + NEW: Full Silhouette Mode (CAM tab)                ║
+    ╚══════════════════════════════════════════════════════╝
+]]
+
+-- ============================================================
+--  SERVICES & GLOBALS
+-- ============================================================
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local RunService       = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SoundService      = game:GetService("SoundService")
+local Lighting          = game:GetService("Lighting")
+local Workspace         = game:GetService("Workspace")
+local LocalPlayer      = Players.LocalPlayer
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Single namespace table for every top-level function.
+-- Luau allows only 200 locals per function scope; this keeps the
+-- main chunk far under that ceiling.
+local F = {}
+
+-- ============================================================
+--  DEFAULT BINDINGS
+-- ============================================================
+local DEFAULT_BINDINGS = {
+    { dir = "LEFT",  key = "Z", id = "243827693" },
+    { dir = "DOWN",  key = "X", id = "182724289" },
+    { dir = "UP",    key = "C", id = "183412246" },
+    { dir = "RIGHT", key = "V", id = "243656287" },
+}
+local CurrentBindings = {}
+for _, v in ipairs(DEFAULT_BINDINGS) do
+    table.insert(CurrentBindings, { dir = v.dir, key = v.key, id = v.id, speedMult = 1, holdLoop = false,
+        alts = {},          -- extra animations for this note: { id = "...", chance = n }
+        mode = "CYCLE",     -- CYCLE / RANDOM / WEIGHTED
+        cycleIdx = 0 })
+end
+
+-- ============================================================
+--  SONG SECTIONS — switchable animation sets
+-- ============================================================
+local sections = {
+    { name = "Default",  ids = { LEFT="204062532", DOWN="204292303", UP="183412246", RIGHT="218504594" } },
+    { name = "Intro",    ids = { LEFT="0", DOWN="0", UP="0", RIGHT="0" } },
+    { name = "Verse",    ids = { LEFT="0", DOWN="0", UP="0", RIGHT="0" } },
+    { name = "Chorus",   ids = { LEFT="0", DOWN="0", UP="0", RIGHT="0" } },
+    { name = "Bridge",   ids = { LEFT="0", DOWN="0", UP="0", RIGHT="0" } },
+}
+local currentSectionIdx  = 1
+local sectionNextKey     = "RightBracket"  -- ] to go next
+local sectionPrevKey     = "LeftBracket"   -- [ to go prev
+
+-- ============================================================
+--  STATE
+-- ============================================================
+local SpacingSystem          -- ★ forward-declared so F.setupCharacter can see it
+local SPACING                -- forward-declared: the save code above its definition needs it
+local INJECTOR_VERSION = "6.2"   -- up here so everything can read it
+local animTracks   = {}
+local idleTrack    = nil
+local connections  = {}
+local animator     = nil
+local character    = nil
+local spacing      = nil
+local rebindingRow = nil
+local guiVisible   = true
+local idleLooping  = false
+
+-- EMOTE CUTTER STATE
+local cutterEnabled  = false
+local cutterAnimId   = "138338762910112"
+local cutterTrack    = nil
+local cutterSlices   = {
+    LEFT  = { start = 0, stop = 0.5, id = "" },
+    DOWN  = { start = 0.5, stop = 1.0, id = "" },
+    UP    = { start = 1.0, stop = 1.5, id = "" },
+    RIGHT = { start = 1.5, stop = 2.0, id = "" },
+}
+local cutterPreviewTrack = nil
+
+-- SOLO MODE STATE
+local soloActive     = false
+local soloKey        = "G"       -- default keybind
+local soloCamDist    = 6         -- how close the camera zooms in
+local soloCamHeight  = 2         -- height offset during solo
+local soloCamFOV     = 45        -- tight FOV for drama
+local soloLetterbox  = 0.12      -- letterbox bar size during solo
+local soloTransition = 0.6       -- seconds to ease in/out
+
+-- ============================================================
+--  SILHOUETTE MODE STATE  (rebuilt)
+-- ============================================================
+function F.silZ(n) return math.clamp(n, 0, 200) end  -- hard ZIndex ceiling
+
+local silhouetteActive = false
+local silhouetteKey    = "H"
+local silhouetteBlend  = 0
+
+local SilFX = {
+    strength        = 1,      -- master intensity 0..1
+    fadeSpeed       = 4,      -- how fast it eases in/out
+    includePlayer   = true,
+    includeOpponent = true,
+    alwaysOnTop     = true,   -- cut-outs render through geometry
+    fillColor       = Color3.new(0, 0, 0),
+}
+
+-- runtime handles + methods live here so we don't burn top-level locals
+local Sil = { cc = nil, blur = nil, conn = nil, highlights = {}, flashGui = nil }
+
+-- ============================================================
+--  CHAOS CAMERA STATE
+--  Everything lives on one table — the main chunk is near
+--  Luau's 200-local ceiling, so this costs a single register.
+-- ============================================================
+
 -- ============================================================
 --  HEALTH BAR STATE — FNF-style drain with sliding icons
 -- ============================================================
@@ -5175,8 +5300,6 @@ end
 --  stage. Grey when idle, the note's colour when pressed. Every
 --  finger is tracked on its own, so chords and holds work.
 -- ============================================================
-local STRUM_GREY = Color3.fromRGB(135, 163, 173)
-
 function Mobile.shouldShow()
     if Mobile.mode == "ON" then return true end
     if Mobile.mode == "OFF" then return false end
@@ -5200,30 +5323,44 @@ function Mobile.layout()
         RIGHT = cx + inner + step,
     }
     for dir, b in pairs(Mobile.btns) do
+        b.base = s
         b.frame.Size = UDim2.new(0, s, 0, s)
         b.frame.Position = UDim2.new(0, xs[dir], 1, -Mobile.bottom - s / 2)
-        b.base = s
+        b.glyph.TextSize = math.floor(s * 0.42)
+        local c = b.frame:FindFirstChildOfClass("UICorner")
+        if c then c.CornerRadius = UDim.new(0, math.floor(s * 0.22)) end
     end
 end
 
+-- The same look and hit flash as the PC arrow strip, scaled up for thumbs.
 function Mobile.paint(dir, down)
     local b = Mobile.btns[dir]
     if not b then return end
     local s = b.base or 80
+    local colors = ARROW_COLORS[dir]
     if down then
-        b.glyph.TextColor3 = ARROW_COLORS[dir].hit
-        b.glyph.TextTransparency = 0
-        b.stroke.Color = Color3.fromRGB(255, 255, 255)
-        b.frame.Size = UDim2.new(0, s * 1.12, 0, s * 1.12)
-        TweenService:Create(b.frame, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-            { Size = UDim2.new(0, s * 0.94, 0, s * 0.94) }):Play()
+        TweenService:Create(b.frame, TweenInfo.new(0.05, Enum.EasingStyle.Linear), {
+            BackgroundColor3 = colors.hit,
+            Size = UDim2.new(0, s * 1.16, 0, s * 1.16),
+        }):Play()
+        TweenService:Create(b.stroke, TweenInfo.new(0.05, Enum.EasingStyle.Linear), { Thickness = 4 }):Play()
+        b.glow.Visible = true
+        TweenService:Create(b.glow, TweenInfo.new(0.05), { BackgroundTransparency = 0.35 }):Play()
     else
-        b.glyph.TextColor3 = STRUM_GREY
-        b.glyph.TextTransparency = Mobile.idleFade
-        b.stroke.Color = Color3.fromRGB(28, 32, 40)
-        TweenService:Create(b.frame, TweenInfo.new(0.14, Enum.EasingStyle.Quad),
-            { Size = UDim2.new(0, s, 0, s) }):Play()
+        TweenService:Create(b.frame, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
+            BackgroundColor3 = colors.idle,
+            Size = UDim2.new(0, s, 0, s),
+        }):Play()
+        TweenService:Create(b.stroke, TweenInfo.new(0.1, Enum.EasingStyle.Linear), { Thickness = 2 }):Play()
+        local tw = TweenService:Create(b.glow, TweenInfo.new(0.15), { BackgroundTransparency = 1 })
+        tw:Play()
+        tw.Completed:Connect(function()
+            if (Mobile.held[dir] or 0) == 0 then b.glow.Visible = false end
+        end)
     end
+    -- idle see-through applies to the resting arrow only
+    b.frame.BackgroundTransparency = down and 0.1 or math.clamp(0.3 + Mobile.idleFade, 0, 0.95)
+    b.glyph.TextTransparency = down and 0 or math.clamp(Mobile.idleFade, 0, 0.9)
 end
 
 function Mobile.press(dir)
@@ -5256,34 +5393,57 @@ function Mobile.build()
     Mobile.gui = sg
 
     for _, dir in ipairs(ARROW_ORDER) do
-        -- the frame is the touch area; it's a little bigger than the arrow
+        local colors = ARROW_COLORS[dir]
+
         local frame = Instance.new("Frame")
         frame.AnchorPoint = Vector2.new(0.5, 0.5)
-        frame.BackgroundTransparency = 1
+        frame.BackgroundColor3 = colors.idle
+        frame.BackgroundTransparency = 0.3
+        frame.BorderSizePixel = 0
         frame.Active = true
         frame.Parent = sg
+        F.uiCorner(frame, UDim.new(0, 18))
+        local stroke = F.uiStroke(frame, Color3.fromRGB(255, 255, 255), 2)
+        stroke.Transparency = 0.5
+
+        local grad = Instance.new("UIGradient")
+        grad.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.1),
+            NumberSequenceKeypoint.new(0.5, 0.35),
+            NumberSequenceKeypoint.new(1, 0.15),
+        })
+        grad.Rotation = 90
+        grad.Parent = frame
+
+        local glow = Instance.new("Frame")
+        glow.Size = UDim2.new(1, 6, 1, 6)
+        glow.AnchorPoint = Vector2.new(0.5, 0.5)
+        glow.Position = UDim2.new(0.5, 0, 0.5, 0)
+        glow.BackgroundColor3 = colors.hit
+        glow.BackgroundTransparency = 1
+        glow.BorderSizePixel = 0
+        glow.ZIndex = 0
+        glow.Visible = false
+        glow.Parent = frame
+        F.uiCorner(glow, UDim.new(0, 20))
 
         local glyph = Instance.new("TextLabel")
         glyph.Size = UDim2.new(1, 0, 1, 0)
         glyph.BackgroundTransparency = 1
         glyph.Text = ARROW_SYMBOLS[dir]
-        glyph.TextColor3 = STRUM_GREY
-        glyph.TextTransparency = Mobile.idleFade
-        glyph.Font = Enum.Font.GothamBlack
-        glyph.TextScaled = true
+        glyph.TextColor3 = Color3.fromRGB(255, 255, 255)
+        glyph.Font = Enum.Font.GothamBold
+        glyph.TextSize = 32
+        glyph.ZIndex = 2
         glyph.Parent = frame
-        local stroke = Instance.new("UIStroke")
-        stroke.Thickness = 3
-        stroke.Color = Color3.fromRGB(28, 32, 40)
-        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
-        stroke.Parent = glyph
 
-        Mobile.btns[dir] = { frame = frame, glyph = glyph, stroke = stroke }
+        Mobile.btns[dir] = { frame = frame, glyph = glyph, stroke = stroke, glow = glow }
 
+        -- a finger (or the mouse, for testing) starting on this arrow
         frame.InputBegan:Connect(function(input)
             local t = input.UserInputType
             if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
-            if Mobile.touches[input] then return end
+            if Mobile.touches[input] ~= nil then return end
             Mobile.touches[input] = dir
             Mobile.press(dir)
         end)
@@ -5292,14 +5452,60 @@ function Mobile.build()
     Mobile.layout()
 end
 
--- A finger lifting anywhere counts, even if it slid off the arrow first,
--- so a note can never get stuck held down.
+-- Which arrow is under a screen point? Touch positions are measured below
+-- the top bar, but these arrows ignore it, so the inset is added back first.
+-- The hit area is a little bigger than the arrow, so a finger rolling across
+-- doesn't fall into gaps.
+function Mobile.hitTest(pos)
+    local inset = Vector2.new(0, 0)
+    pcall(function() inset = game:GetService("GuiService"):GetGuiInset() end)
+    local p = Vector2.new(pos.X, pos.Y) + inset
+    local best, bestD
+    for dir, b in pairs(Mobile.btns) do
+        local ap, as = b.frame.AbsolutePosition, b.frame.AbsoluteSize
+        local pad = as.X * 0.12
+        if p.X >= ap.X - pad and p.X <= ap.X + as.X + pad
+            and p.Y >= ap.Y - pad and p.Y <= ap.Y + as.Y + pad then
+            local d = (p - (ap + as / 2)).Magnitude
+            if not bestD or d < bestD then best, bestD = dir, d end
+        end
+    end
+    return best
+end
+
+-- A tracked finger moved: if it's now over a different arrow, let go of the
+-- old one and press the new one, the way FNF mobile hitboxes work. Sliding
+-- off every arrow releases the note; sliding back on presses again.
+-- Entries hold the arrow under the finger, or false when it's between them.
+function Mobile.retarget(input, pos)
+    local cur = Mobile.touches[input]
+    if cur == nil then return end
+    local now = Mobile.hitTest(pos) or false
+    if now == cur then return end
+    if cur then Mobile.release(cur) end
+    Mobile.touches[input] = now
+    if now then Mobile.press(now) end
+end
+
+UserInputService.TouchMoved:Connect(function(touch)
+    Mobile.retarget(touch, touch.Position)
+end)
+-- mouse testing on PC: the held button's position comes from mouse movement
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    for tracked, _ in pairs(Mobile.touches) do
+        if tracked.UserInputType == Enum.UserInputType.MouseButton1 then
+            Mobile.retarget(tracked, input.Position)
+        end
+    end
+end)
+
+-- A finger lifting anywhere counts, so a note can never get stuck held down.
 local function mobileEnded(input)
     local dir = Mobile.touches[input]
-    if dir then
-        Mobile.touches[input] = nil
-        Mobile.release(dir)
-    end
+    if dir == nil then return end
+    Mobile.touches[input] = nil
+    if dir then Mobile.release(dir) end
 end
 UserInputService.InputEnded:Connect(mobileEnded)
 UserInputService.TouchEnded:Connect(function(touch) mobileEnded(touch) end)
@@ -5313,10 +5519,11 @@ function Mobile.refresh()
         Mobile.layout()
     elseif Mobile.gui then
         -- let go of anything still held before hiding
-        for dir, n in pairs(Mobile.held) do
-            if n > 0 then Mobile.held[dir] = 1; Mobile.release(dir) end
+        for input, dir in pairs(Mobile.touches) do
+            if dir then Mobile.release(dir) end
+            Mobile.touches[input] = nil
         end
-        Mobile.touches = {}
+        Mobile.held = {}
         Mobile.gui.Enabled = false
     end
     if Arrows.container then
@@ -12051,7 +12258,7 @@ function F.buildTab_Settings(pages)
     local mbTitle = F.makeLabel(pg6, "MOBILE ARROWS", UDim2.new(0,8,0,mbY+6),
         UDim2.new(1,-16,0,20), Color3.fromRGB(120,220,255), Enum.TextXAlignment.Left, 12)
     mbTitle.Font = Enum.Font.GothamBold
-    F.makeLabel(pg6, "Big touch arrows along the bottom, split into two pairs like FNF on mobile. Tap or hold them exactly like your note keys.",
+    F.makeLabel(pg6, "Big touch arrows along the bottom, split into two pairs like FNF on mobile, in the same style as the PC arrows. Tap, hold, or slide between them.",
         UDim2.new(0,8,0,mbY+26), UDim2.new(1,-16,0,28), Color3.fromRGB(130,130,150), Enum.TextXAlignment.Left, 9).TextWrapped = true
 
     local mbMode = F.makeBtn(pg6, "", UDim2.new(0,8,0,mbY+58), UDim2.new(0,190,0,28), Color3.fromRGB(35,35,55), nil, 10)
@@ -12390,7 +12597,8 @@ task.spawn(F.setupMusicRemote)
 task.spawn(F.setupMatchRemote)
 F.broadcastScriptPresence()
 
-print("[FNF] Injector v7.0 fully loaded")
+print("[FNF] Injector v.70")
+
 
 </script>
 
